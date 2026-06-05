@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+
+# Processed data outputs
+data/processed/
