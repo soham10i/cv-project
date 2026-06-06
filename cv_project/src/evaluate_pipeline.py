@@ -30,8 +30,15 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 from skimage.filters import threshold_otsu
+
+# Threshold grid for the segmentation diagnostic (fine at the low end, where
+# the optimum sits — tumour residuals are small after baseline subtraction).
+SEG_GRID = np.concatenate([
+    np.linspace(0.005, 0.20, 40),
+    np.linspace(0.21, 1.00, 40),
+]).astype(np.float32)
 
 # pyrefly: ignore [missing-import]
 from diffusers import AutoencoderKL
@@ -134,6 +141,10 @@ def evaluate(args):
 
     per_image = []
     aurocs, dices = [], []
+    # Threshold-independent segmentation diagnostics
+    auprcs, best_dices = [], []
+    seg_grid_sum = np.zeros(len(SEG_GRID), dtype=np.float64)
+    n_seg = 0
 
     for i, (image, gt_mask, name) in enumerate(loader):
         if args.n_images is not None and i >= args.n_images:
@@ -204,11 +215,38 @@ def evaluate(args):
         pred_bin = ((score > thr).astype(np.float32)) * bmask
         dice = utils.compute_dice(pred_bin, gt_bin)
 
+        # ── Threshold-independent diagnostics ────────────────────────
+        #   AUPRC: segmentation quality with no cutoff.
+        #   best_dice: oracle per-slice DICE (sweep threshold, take max).
+        #   seg_grid_sum: accumulate DICE at each GLOBAL threshold so we can
+        #                 later pick one fixed operating point.
+        auprc = float("nan")
+        best_dice = float("nan")
+        gt_sum = float(gt_bin.sum())
+        if gt_sum > 0:
+            if gt_flat.sum() > 0 and score_flat.max() > score_flat.min():
+                try:
+                    auprc = float(average_precision_score(gt_flat, score_flat))
+                except ValueError:
+                    pass
+            preds = score[None, :, :] > SEG_GRID[:, None, None]       # (G, H, W)
+            inter = (preds * gt_bin[None, :, :]).sum(axis=(1, 2))      # (G,)
+            psum  = preds.reshape(len(SEG_GRID), -1).sum(axis=1)       # (G,)
+            dice_grid = 2.0 * inter / (psum + gt_sum + 1e-8)          # (G,)
+            best_dice = float(dice_grid.max())
+            seg_grid_sum += dice_grid
+            n_seg += 1
+            if not np.isnan(auprc):
+                auprcs.append(auprc)
+            best_dices.append(best_dice)
+
         if not np.isnan(auroc):
             aurocs.append(auroc)
         dices.append(dice)
-        per_image.append({"name": name_str, "auroc": auroc, "dice": dice})
-        log.info("[%d/%d] %s  AUROC %.4f | DICE %.4f", i + 1, n_total, name_str, auroc, dice)
+        per_image.append({"name": name_str, "auroc": auroc, "dice": dice,
+                          "auprc": auprc, "best_dice": best_dice})
+        log.info("[%d/%d] %s  AUROC %.4f | AUPRC %.4f | DICE %.4f | bestDICE %.4f",
+                 i + 1, n_total, name_str, auroc, auprc, dice, best_dice)
 
         # 4. Visualisation (capped) ──────────────────────────────────
         if i < args.max_plots:
@@ -218,13 +256,27 @@ def evaluate(args):
         del z0, z_noisy, z_den, noise, recon
         utils.clear_cache()
 
+    # ── Global threshold sweep: best single operating point ──────
+    global_best_thr = float("nan")
+    global_best_dice = float("nan")
+    if n_seg > 0:
+        mean_dice_by_thr = seg_grid_sum / n_seg            # (G,)
+        best_idx = int(np.argmax(mean_dice_by_thr))
+        global_best_thr  = float(SEG_GRID[best_idx])
+        global_best_dice = float(mean_dice_by_thr[best_idx])
+
     # ── Aggregate ────────────────────────────────────────────────
     summary = {
         "n_images": len(per_image),
         "auroc_mean": float(np.mean(aurocs)) if aurocs else float("nan"),
         "auroc_std":  float(np.std(aurocs))  if aurocs else float("nan"),
+        "auprc_mean": float(np.mean(auprcs)) if auprcs else float("nan"),
         "dice_mean":  float(np.mean(dices))  if dices  else float("nan"),
         "dice_std":   float(np.std(dices))   if dices  else float("nan"),
+        "best_dice_mean_oracle": float(np.mean(best_dices)) if best_dices else float("nan"),
+        "global_best_threshold": global_best_thr,
+        "global_best_dice_mean": global_best_dice,
+        "calibrated_thr_pixel": thr_pixel,
         "fusion": use_fusion,
         "t_int": args.t_int,
         "per_image": per_image,
@@ -234,8 +286,13 @@ def evaluate(args):
 
     log.info("=" * 60)
     log.info("AGGREGATE over %d images:", summary["n_images"])
-    log.info("  AUROC: %.4f ± %.4f", summary["auroc_mean"], summary["auroc_std"])
-    log.info("  DICE : %.4f ± %.4f", summary["dice_mean"], summary["dice_std"])
+    log.info("  AUROC               : %.4f ± %.4f", summary["auroc_mean"], summary["auroc_std"])
+    log.info("  AUPRC               : %.4f", summary["auprc_mean"])
+    log.info("  DICE @ calib thr=%.3f: %.4f ± %.4f  (detection threshold)",
+             thr_pixel if thr_pixel else float("nan"), summary["dice_mean"], summary["dice_std"])
+    log.info("  DICE @ best global thr=%.3f: %.4f  (realistic single cutoff)",
+             global_best_thr, global_best_dice)
+    log.info("  DICE oracle (per-slice best): %.4f  (ceiling)", summary["best_dice_mean_oracle"])
     log.info("  Metrics → %s", C.RESULTS_DIR / "metrics.json")
     log.info("=" * 60)
 

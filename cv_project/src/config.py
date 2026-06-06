@@ -106,3 +106,27 @@ LATENT_FUSION_ALPHA = 0.5
 # Reproducibility
 # ─────────────────────────────────────────────
 SEED = 42
+
+# ═════════════════════════════════════════════
+# MedSegDiff — supervised conditional diffusion SEGMENTATION
+# ═════════════════════════════════════════════
+# A separate, supervised pipeline: diffuse the binary tumour mask conditioned
+# on the 3-channel MRI.  Pixel-space (no VAE).  Patient-level split across all
+# raw patients.  Shares utils' generic diffusion helpers (schedulers/EMA).
+SEG_DATA_DIR    = _path("CV_SEG_DIR",        PROJECT_ROOT / "data" / "seg")
+SEG_MODEL_DIR   = _path("CV_SEG_MODEL_DIR",  PROJECT_ROOT / "model_medsegdiff")
+SEG_RESULTS_DIR = _path("CV_SEG_RESULTS_DIR", PROJECT_ROOT / "results_medsegdiff")
+SEG_SPLIT_PATH  = SEG_DATA_DIR / "split.json"
+
+SEG_IMG_SIZE    = 256                 # stored slice size (preprocess output)
+SEG_TRAIN_SIZE  = 128                 # train/sample at this size (256² pixel-diffusion too heavy
+                                      #   for 8 GB); predictions upsampled to 256² for fair DICE
+SEG_SPLIT_FRACS = (0.70, 0.15, 0.15)  # train / val / test, BY PATIENT
+SEG_NEG_RATIO   = 0.5                 # healthy (empty-mask) slices kept per tumour slice
+SEG_MASK_THRESH = 0.0                 # predicted mask is x0_pred > this (x0 in [-1,1])
+SEG_ENSEMBLE    = 1                   # inference samples to average (STAPLE-lite; >1 = ensemble)
+
+# Model architecture
+SEG_BASE_CH  = 64
+SEG_CH_MULT  = (1, 2, 4, 8)
+SEG_ATTN_RES = (32, 16)               # self-attention at these spatial sizes

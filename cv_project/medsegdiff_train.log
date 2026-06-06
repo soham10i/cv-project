@@ -1,0 +1,7 @@
+21:49:17 | INFO    | Device: cuda | train size 128²
+21:49:18 | INFO    | Data: 13876 train / 2958 val slices
+21:49:18 | INFO    | MedSegDiff U-Net: 58.8M params
+21:49:18 | INFO    | AMP fp16: True
+21:49:18 | INFO    | ============================================================
+21:49:18 | INFO    | Training: 25 epochs | bs 12 | lr 1.0e-04 | EMA 0.9990
+21:49:18 | INFO    | ============================================================

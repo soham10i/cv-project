@@ -1,0 +1,29 @@
+19:54:55 | INFO    | Device: cuda
+19:54:55 | INFO    | Loading VAE …
+Cannot initialize model with low cpu memory usage because `accelerate` was not found in the environment. Defaulting to `low_cpu_mem_usage=False`. It is strongly recommended to install `accelerate` for faster and less memory-intense model loading. You can do so with: 
+```
+pip install accelerate
+```
+.
+/home/28a5/Documents/cv/myenv/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py:205: UserWarning: The `local_dir_use_symlinks` argument is deprecated and ignored in `hf_hub_download`. Downloading to a local directory does not use symlinks anymore.
+  warnings.warn(
+19:54:55 | INFO    | HTTP Request: HEAD https://huggingface.co/stabilityai/sd-vae-ft-mse/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
+19:54:55 | INFO    | HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/stabilityai/sd-vae-ft-mse/31f26fdeee1355a5c34592e401dd41e45d25a493/config.json "HTTP/1.1 200 OK"
+19:54:55 | INFO    | HTTP Request: HEAD https://huggingface.co/stabilityai/sd-vae-ft-mse/resolve/31f26fdeee1355a5c34592e401dd41e45d25a493/diffusion_pytorch_model.safetensors.index.json "HTTP/1.1 404 Not Found"
+19:54:56 | INFO    | Loading EMA UNet from '/home/28a5/Documents/cv/cv_project/model/unet_ema'
+Cannot initialize model with low cpu memory usage because `accelerate` was not found in the environment. Defaulting to `low_cpu_mem_usage=False`. It is strongly recommended to install `accelerate` for faster and less memory-intense model loading. You can do so with: 
+```
+pip install accelerate
+```
+.
+19:54:56 | INFO    | M_baseline loaded (mean 0.0706) | thr_pixel=0.9904223084449768
+19:54:56 | INFO    | Scanning 2000 masks for tumour size > 1000 px …
+19:54:56 | INFO    | Selected: BraTS-PED-00001-000_z064.npy  (tumour area = 1100 px)
+19:54:56 | INFO    | ─── Forward trajectory: [0, 50, 100, 150, 200, 250, 300] ───
+19:54:58 | INFO    | ─── Reverse trajectory: 16 DDIM steps from T_int=300 ───
+19:54:58 | INFO    | SAAM: hooked 16 self-attention layers
+19:54:59 | INFO    | AUROC: 0.6938  |  DICE: 0.0000
+19:55:01 | INFO    | Final eval saved → /home/28a5/Documents/cv/cv_project/results/trajectory/final_eval.png
+19:55:01 | INFO    | ============================================================
+19:55:01 | INFO    | DONE — all outputs in /home/28a5/Documents/cv/cv_project/results/trajectory
+19:55:01 | INFO    | ============================================================
