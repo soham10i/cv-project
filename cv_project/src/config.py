@@ -96,6 +96,17 @@ LR_ETA_MIN     = 1e-6      # cosine-annealing floor
 MAX_CAL_SAMPLES      = 100   # held-out healthy slices used for baseline+threshold
 THRESHOLD_PERCENTILE = 99    # operational threshold from healthy residual dist.
 
+# The SEGMENTATION threshold is the THRESHOLD_PERCENTILE-th percentile of the
+# pooled distribution of healthy *brain-voxel* residuals — NOT the per-slice
+# maximum.  Using per-slice maxima yields an image-level DETECTION cutoff that,
+# applied per pixel, collapses every predicted mask to empty (DICE=0).
+#
+# Median-filter the residual map before scoring/thresholding to drop isolated
+# single-pixel responses (tumours are contiguous).  Applied identically during
+# healthy calibration and test scoring so the two stay distribution-matched.
+RESIDUAL_MEDIAN_FILTER = True
+RESIDUAL_MEDIAN_SIZE   = 3
+
 # Dual-space fusion (M_pixel + M_latent).  OFF by default — the pixel-only
 # path is the validated default.  When ON, maps are standardised by healthy
 # scales (saved at calibration) so a single global threshold stays valid.

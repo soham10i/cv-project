@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import median_filter
 
 # pyrefly: ignore [missing-import]
 from diffusers import DDIMScheduler, DDPMScheduler, UNet2DModel
@@ -371,15 +372,27 @@ def latent_residual_2d(z0: torch.Tensor, z_denoised: torch.Tensor,
     return m[0, 0].cpu().numpy()
 
 
+def _finalize_pixel_map(diff_abs: np.ndarray, m_baseline: np.ndarray,
+                        brain_mask: np.ndarray) -> np.ndarray:
+    """
+    Shared core of the pixel-residual map, used by BOTH healthy calibration and
+    test scoring so the two distributions match:
+
+        clip( mean_channels(|orig − recon| − M_baseline), 0 ) · brain_mask
+        → optional median filter (re-masked)
+
+    ``diff_abs`` is the per-channel ``|orig − recon|`` (3, H, W).
+    """
+    diff = np.clip(diff_abs - m_baseline, 0, None).mean(axis=0) * brain_mask
+    if C.RESIDUAL_MEDIAN_FILTER:
+        diff = median_filter(diff, size=C.RESIDUAL_MEDIAN_SIZE) * brain_mask
+    return diff                                            # (256, 256)
+
+
 def pixel_residual_2d(orig_norm_np: np.ndarray, recon_np: np.ndarray,
                       m_baseline: np.ndarray, brain_mask: np.ndarray) -> np.ndarray:
-    """
-    Calibrated, brain-masked pixel residual:
-        clip( mean_channels(|orig − recon| − M_baseline), 0 ) · brain_mask
-    """
-    diff = np.abs(orig_norm_np - recon_np) - m_baseline    # (3, 256, 256)
-    diff = np.clip(diff, 0, None)
-    return diff.mean(axis=0) * brain_mask                  # (256, 256)
+    """Calibrated, brain-masked, median-filtered pixel residual (256, 256)."""
+    return _finalize_pixel_map(np.abs(orig_norm_np - recon_np), m_baseline, brain_mask)
 
 
 def fuse_maps(m_pixel: np.ndarray, m_latent: np.ndarray,
@@ -455,30 +468,55 @@ def calibrate_on_healthy(vae, unet, val_loader, device, *,
     m_baseline = (residual_sum / n_samples).astype(np.float32)     # (3,H,W)
 
     # ── Pass 2 (in-memory): scales, then thresholds ─────────────────────
-    pixel_maps, latent_maps = [], []
+    pixel_maps, latent_maps, masks = [], [], []
     for raw_diff, lat_2d, bmask in cache:
-        diff = np.clip(raw_diff - m_baseline, 0, None).mean(axis=0) * bmask
-        pixel_maps.append(diff)
+        pixel_maps.append(_finalize_pixel_map(raw_diff, m_baseline, bmask))
         latent_maps.append(lat_2d * bmask)
+        masks.append(bmask)
 
     pixel_scale  = float(np.mean([m[m > 0].mean() if np.any(m > 0) else 0.0 for m in pixel_maps]))
     latent_scale = float(np.mean([m[m > 0].mean() if np.any(m > 0) else 0.0 for m in latent_maps]))
     pixel_scale  = pixel_scale  or 1.0
     latent_scale = latent_scale or 1.0
 
+    # ── SEGMENTATION threshold (BUG FIX) ─────────────────────────────────
+    # Pool ALL healthy brain-voxel residuals and take the percentile of that
+    # distribution.  The previous code used the percentile of per-slice maxima,
+    # which is an image-level DETECTION cutoff; applied per pixel it set every
+    # mask to empty (DICE=0).  We also export healthy mean/std so a future
+    # per-image z-score ("sigmas above healthy") path can reuse them.
+    healthy_vox_list = [m[bm > 0].ravel()
+                        for m, bm in zip(pixel_maps, masks) if np.any(bm > 0)]
+    healthy_vox = (np.concatenate(healthy_vox_list)
+                   if healthy_vox_list else np.zeros(1, dtype=np.float32))
+    threshold_pixel = float(np.percentile(healthy_vox, percentile))
+    healthy_mu      = float(healthy_vox.mean())
+    healthy_sigma   = float(healthy_vox.std()) or 1.0
+
+    # Fused (dual-space) segmentation threshold — same per-voxel percentile so
+    # it is a valid pixel cutoff if USE_LATENT_FUSION is enabled.
+    fused_maps = [fuse_maps(mp, ml, pixel_scale, latent_scale, alpha)
+                  for mp, ml in zip(pixel_maps, latent_maps)]
+    fused_vox_list = [fm[bm > 0].ravel()
+                      for fm, bm in zip(fused_maps, masks) if np.any(bm > 0)]
+    fused_vox = (np.concatenate(fused_vox_list)
+                 if fused_vox_list else np.zeros(1, dtype=np.float32))
+    threshold_fused = float(np.percentile(fused_vox, percentile))
+
+    # Image-level detection threshold kept (correctly named) for slice-level
+    # "does this slice contain a tumour?" scoring.
     max_pixel = [m.max() for m in pixel_maps]
-    max_fused = [
-        fuse_maps(mp, ml, pixel_scale, latent_scale, alpha).max()
-        for mp, ml in zip(pixel_maps, latent_maps)
-    ]
 
     calib = {
         "t_int": int(t_int),
         "ddim_steps": int(ddim_steps),
         "n_samples": int(n_samples),
         "percentile": float(percentile),
-        "threshold_pixel": float(np.percentile(max_pixel, percentile)),
-        "threshold_fused": float(np.percentile(max_fused, percentile)),
+        "threshold_pixel": threshold_pixel,                       # per-pixel segmentation
+        "threshold_detect_imagelevel": float(np.percentile(max_pixel, percentile)),
+        "threshold_fused": threshold_fused,
+        "healthy_mu": healthy_mu,
+        "healthy_sigma": healthy_sigma,
         "pixel_scale": pixel_scale,
         "latent_scale": latent_scale,
         "alpha": float(alpha),
