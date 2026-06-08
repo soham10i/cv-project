@@ -132,8 +132,22 @@ def make_ddim_scheduler() -> DDIMScheduler:
 
 def inference_timesteps(ddim: DDIMScheduler, t_int: int = C.T_INT,
                         ddim_steps: int = C.DDIM_STEPS) -> torch.Tensor:
-    """DDIM timesteps from t_int → 0 (partial-noise reconstruction)."""
-    ddim.set_timesteps(ddim_steps)
+    """
+    DDIM timesteps from ``t_int`` → 0 for partial-noise reconstruction.
+
+    ``ddim_steps`` is the number of *actual* denoising steps taken inside the
+    reconstruction window [0, t_int] — NOT over the full [0, 1000] range.
+
+    The naive ``set_timesteps(ddim_steps)`` spaces steps over all 1000 training
+    timesteps and then keeps only those ≤ t_int, so the real step count
+    collapses to ``ddim_steps · t_int / 1000`` (e.g. 25 steps @ t_int=150 → 4
+    steps — almost no denoising).  Here we scale ``num_inference_steps`` up by
+    ``1000 / t_int`` so ~``ddim_steps`` steps land in the window, while the
+    per-step spacing (and therefore DDIM's prev_timestep math) stays valid.
+    """
+    full_steps = max(ddim_steps,
+                     round(ddim_steps * C.NUM_TRAIN_TIMESTEPS / max(t_int, 1)))
+    ddim.set_timesteps(full_steps)
     all_ts = ddim.timesteps
     return all_ts[all_ts <= t_int]
 

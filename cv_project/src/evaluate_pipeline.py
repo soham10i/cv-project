@@ -104,14 +104,25 @@ def evaluate(args):
 
     unet = utils.load_unet(device)
 
-    ddim = utils.make_ddim_scheduler()
-    timesteps = utils.inference_timesteps(ddim, args.t_int, args.ddim_steps)
-    log.info("DDIM: %d steps total → %d steps from T_int=%d to 0",
-             args.ddim_steps, len(timesteps), args.t_int)
-
     # ── Calibration (baseline + threshold + scales) ──────────────
     m_baseline, calib = utils.load_calibration()
     log.info("M_baseline loaded: shape %s, mean %.4f", m_baseline.shape, m_baseline.mean())
+
+    # The threshold in calibration.json is ONLY valid for the T_int/steps it was
+    # computed at.  Default eval to those so the two can never silently diverge;
+    # explicit --t-int / --ddim-steps still override (e.g. for ablations).
+    if args.t_int is None:
+        args.t_int = calib["t_int"] if calib else C.T_INT
+    if args.ddim_steps is None:
+        args.ddim_steps = calib["ddim_steps"] if calib else C.DDIM_STEPS
+    if calib is not None and (args.t_int != calib["t_int"] or args.ddim_steps != calib["ddim_steps"]):
+        log.warning("EVAL T_int=%d/steps=%d ≠ CALIBRATION T_int=%d/steps=%d — "
+                    "the calibrated threshold may not be valid at this setting.",
+                    args.t_int, args.ddim_steps, calib["t_int"], calib["ddim_steps"])
+
+    ddim = utils.make_ddim_scheduler()
+    timesteps = utils.inference_timesteps(ddim, args.t_int, args.ddim_steps)
+    log.info("DDIM: %d denoising steps from T_int=%d to 0", len(timesteps), args.t_int)
 
     use_fusion = C.USE_LATENT_FUSION
     if calib is not None:
@@ -339,8 +350,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n-images",   type=int, default=None, help="Number of test images (default: all)")
     parser.add_argument("--max-plots",  type=int, default=12,   help="Max per-image figures to save (default: 12)")
-    parser.add_argument("--ddim-steps", type=int, default=C.DDIM_STEPS, help=f"Total DDIM steps (default: {C.DDIM_STEPS})")
-    parser.add_argument("--t-int",      type=int, default=C.T_INT, help=f"Intermediate noise timestep (default: {C.T_INT})")
+    parser.add_argument("--ddim-steps", type=int, default=None, help="Denoising steps in [0, T_int] (default: value from calibration.json)")
+    parser.add_argument("--t-int",      type=int, default=None, help="Intermediate noise timestep (default: value from calibration.json)")
     args = parser.parse_args()
 
     evaluate(args)
