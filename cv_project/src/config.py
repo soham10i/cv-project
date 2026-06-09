@@ -94,7 +94,11 @@ LR_ETA_MIN     = 1e-6
 # Calibration / scoring
 # ─────────────────────────────────────────────
 MAX_CAL_SAMPLES      = 100
-THRESHOLD_PERCENTILE = 99
+# Percentile of the POOLED healthy brain-voxel score distribution used as the
+# operating threshold → a per-voxel false-positive rate of (100-percentile)%.
+# 95 (5% voxel FPR) is a reasonable segmentation default; the ablation sweeps
+# this to find the DICE-optimal point for a given trained model.
+THRESHOLD_PERCENTILE = 95
 
 # Dual-space fusion (pixel + latent residual). OFF by default.
 USE_LATENT_FUSION   = False
