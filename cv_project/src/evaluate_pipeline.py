@@ -33,12 +33,24 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_auc_score, average_precision_score
 from skimage.filters import threshold_otsu
 
-# Threshold grid for the segmentation diagnostic (fine at the low end, where
-# the optimum sits — tumour residuals are small after baseline subtraction).
-SEG_GRID = np.concatenate([
-    np.linspace(0.005, 0.20, 40),
-    np.linspace(0.21, 1.00, 40),
-]).astype(np.float32)
+def make_seg_grid(score_max: float, n: int = 80) -> np.ndarray:
+    """
+    Build a threshold sweep grid that covers [0, score_max].
+
+    The fused score space is standardised by healthy scales so values can
+    reach 5–10+; the old hardcoded [0.005, 1.0] grid caused the oracle and
+    best-global-threshold to be meaningless whenever fusion is active (the
+    grid always hit its ceiling).  This function adapts to the actual range.
+    """
+    lo = max(score_max * 0.001, 1e-4)
+    hi = score_max * 1.05          # slight overshoot so ceiling is never best
+    # denser at the low end where the DICE optimum usually sits
+    split = hi * 0.3
+    g = np.concatenate([
+        np.linspace(lo, split, n // 2),
+        np.linspace(split, hi, n - n // 2),
+    ])
+    return g.astype(np.float32)
 
 # pyrefly: ignore [missing-import]
 from diffusers import AutoencoderKL
@@ -150,11 +162,19 @@ def evaluate(args):
     log.info("Evaluating %d images  (saving up to %d plots)", n_total, args.max_plots)
     log.info("=" * 60)
 
+    # Build the threshold sweep grid from the actual operating threshold so the
+    # grid always covers the anomalous score region.  Fused scores are
+    # standardised (pixel/scale + α·latent/scale) and can reach 5–10+ for
+    # clear lesions; the old hardcoded [0.005, 1.0] grid was far too narrow.
+    op_thr = thr_fused if use_fusion else thr_pixel
+    if op_thr is None:
+        op_thr = 0.5
+    seg_grid = make_seg_grid(max(op_thr * 40, 1.0))
+
     per_image = []
     aurocs, dices = [], []
-    # Threshold-independent segmentation diagnostics
     auprcs, best_dices = [], []
-    seg_grid_sum = np.zeros(len(SEG_GRID), dtype=np.float64)
+    seg_grid_sum = np.zeros(len(seg_grid), dtype=np.float64)
     n_seg = 0
 
     for i, (image, gt_mask, name) in enumerate(loader):
@@ -240,9 +260,9 @@ def evaluate(args):
                     auprc = float(average_precision_score(gt_flat, score_flat))
                 except ValueError:
                     pass
-            preds = score[None, :, :] > SEG_GRID[:, None, None]       # (G, H, W)
+            preds = score[None, :, :] > seg_grid[:, None, None]       # (G, H, W)
             inter = (preds * gt_bin[None, :, :]).sum(axis=(1, 2))      # (G,)
-            psum  = preds.reshape(len(SEG_GRID), -1).sum(axis=1)       # (G,)
+            psum  = preds.reshape(len(seg_grid), -1).sum(axis=1)       # (G,)
             dice_grid = 2.0 * inter / (psum + gt_sum + 1e-8)          # (G,)
             best_dice = float(dice_grid.max())
             seg_grid_sum += dice_grid
@@ -273,7 +293,7 @@ def evaluate(args):
     if n_seg > 0:
         mean_dice_by_thr = seg_grid_sum / n_seg            # (G,)
         best_idx = int(np.argmax(mean_dice_by_thr))
-        global_best_thr  = float(SEG_GRID[best_idx])
+        global_best_thr  = float(seg_grid[best_idx])
         global_best_dice = float(mean_dice_by_thr[best_idx])
 
     # ── Aggregate ────────────────────────────────────────────────

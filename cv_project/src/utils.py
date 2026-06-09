@@ -469,16 +469,29 @@ def calibrate_on_healthy(vae, unet, val_loader, device, *,
     m_baseline = (residual_sum / n_samples).astype(np.float32)     # (3,H,W)
 
     # ── Pass 2 (in-memory): scales, then thresholds ─────────────────────
-    pixel_maps, latent_maps = [], []
+    pixel_maps, latent_maps, masks = [], [], []
     for raw_diff, lat_2d, bmask in cache:
         diff = np.clip(raw_diff - m_baseline, 0, None).mean(axis=0) * bmask
         pixel_maps.append(diff)
         latent_maps.append(lat_2d * bmask)
+        masks.append(bmask > 0)
 
     pixel_scale  = float(np.mean([m[m > 0].mean() if np.any(m > 0) else 0.0 for m in pixel_maps]))
     latent_scale = float(np.mean([m[m > 0].mean() if np.any(m > 0) else 0.0 for m in latent_maps]))
     pixel_scale  = pixel_scale  or 1.0
     latent_scale = latent_scale or 1.0
+
+    # Threshold = ``percentile``-th of the POOLED healthy BRAIN-VOXEL score
+    # distribution, i.e. a per-voxel false-positive rate of (100-percentile)%.
+    # (The previous threshold was the percentile of the per-slice MAX residual —
+    # an extreme-value, slice-level detection threshold that sat ~16× too high
+    # for pixel segmentation and drove DICE to 0.)  The slice-MAX percentile is
+    # still saved separately for slice-level anomaly detection.
+    pixel_voxels = np.concatenate([mp[m] for mp, m in zip(pixel_maps, masks)])
+    fused_voxels = np.concatenate([
+        fuse_maps(mp, ml, pixel_scale, latent_scale, alpha)[m]
+        for mp, ml, m in zip(pixel_maps, latent_maps, masks)
+    ])
 
     max_pixel = [m.max() for m in pixel_maps]
     max_fused = [
@@ -491,8 +504,12 @@ def calibrate_on_healthy(vae, unet, val_loader, device, *,
         "ddim_steps": int(ddim_steps),
         "n_samples": int(n_samples),
         "percentile": float(percentile),
-        "threshold_pixel": float(np.percentile(max_pixel, percentile)),
-        "threshold_fused": float(np.percentile(max_fused, percentile)),
+        # Voxel-level thresholds (used for segmentation / DICE):
+        "threshold_pixel": float(np.percentile(pixel_voxels, percentile)),
+        "threshold_fused": float(np.percentile(fused_voxels, percentile)),
+        # Slice-level detection thresholds (per-slice max), kept for reference:
+        "threshold_pixel_slicemax": float(np.percentile(max_pixel, percentile)),
+        "threshold_fused_slicemax": float(np.percentile(max_fused, percentile)),
         "pixel_scale": pixel_scale,
         "latent_scale": latent_scale,
         "alpha": float(alpha),

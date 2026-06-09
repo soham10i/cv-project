@@ -70,8 +70,11 @@ def calibrate_cell(vae, unet, healthy_files, device, t_int, ddim_steps,
     m_baseline       : (3, H, W)
     pixel_scale      : float
     latent_scale     : float
-    healthy_max_pixel: list[float]   per-slice max pixel score
-    healthy_max_fused: list[float]   per-slice max fused score (at ``alpha``)
+    healthy_px_voxels: np.ndarray    pooled healthy brain-voxel pixel scores
+    healthy_fz_voxels: np.ndarray    pooled healthy brain-voxel fused scores
+
+    Thresholds are derived as percentiles of the pooled BRAIN-VOXEL score
+    distribution (per-voxel FPR), matching utils.calibrate_on_healthy.
     """
     ddim = utils.make_ddim_scheduler()
     timesteps = utils.inference_timesteps(ddim, t_int, ddim_steps)
@@ -100,21 +103,22 @@ def calibrate_cell(vae, unet, healthy_files, device, t_int, ddim_steps,
         raise RuntimeError("Healthy calibration set is empty.")
     m_baseline = (residual_sum / n).astype(np.float32)
 
-    # Pass 2: scales, then per-slice max scores
-    pixel_maps, latent_maps = [], []
+    # Pass 2: scales, then pooled brain-voxel score distributions
+    pixel_maps, latent_maps, masks = [], [], []
     for raw_diff, lat_2d, bmask in cache:
         pixel_maps.append(np.clip(raw_diff - m_baseline, 0, None).mean(axis=0) * bmask)
         latent_maps.append(lat_2d * bmask)
+        masks.append(bmask > 0)
 
     pixel_scale  = float(np.mean([m[m > 0].mean() if np.any(m > 0) else 0.0 for m in pixel_maps])) or 1.0
     latent_scale = float(np.mean([m[m > 0].mean() if np.any(m > 0) else 0.0 for m in latent_maps])) or 1.0
 
-    healthy_max_pixel = [float(m.max()) for m in pixel_maps]
-    healthy_max_fused = [
-        float(utils.fuse_maps(mp, ml, pixel_scale, latent_scale, alpha).max())
-        for mp, ml in zip(pixel_maps, latent_maps)
-    ]
-    return m_baseline, pixel_scale, latent_scale, healthy_max_pixel, healthy_max_fused
+    healthy_px_voxels = np.concatenate([mp[m] for mp, m in zip(pixel_maps, masks)])
+    healthy_fz_voxels = np.concatenate([
+        utils.fuse_maps(mp, ml, pixel_scale, latent_scale, alpha)[m]
+        for mp, ml, m in zip(pixel_maps, latent_maps, masks)
+    ])
+    return m_baseline, pixel_scale, latent_scale, healthy_px_voxels, healthy_fz_voxels
 
 
 @torch.no_grad()
@@ -262,7 +266,7 @@ def main(args):
             t0 = time.time()
             log.info("── CELL  t_int=%d  ddim_steps=%d  — reconstructing …", t_int, ddim_steps)
 
-            m_baseline, p_scale, l_scale, h_max_p, h_max_f = calibrate_cell(
+            m_baseline, p_scale, l_scale, h_vox_p, h_vox_f = calibrate_cell(
                 vae, unet, healthy_files, device, t_int, ddim_steps, alpha,
                 generator, args.max_cal_samples)
 
@@ -281,12 +285,12 @@ def main(args):
 
             for fusion in fusion_modes:
                 key       = "fused" if fusion else "pixel"
-                h_max     = h_max_f if fusion else h_max_p
+                h_vox     = h_vox_f if fusion else h_vox_p
                 auroc_m   = auroc_fused if fusion else auroc_pixel
                 auprc_m   = auprc_fused if fusion else auprc_pixel
 
                 for pct in args.percentiles:
-                    thr = float(np.percentile(h_max, pct))
+                    thr = float(np.percentile(h_vox, pct))
                     dices = [
                         _dice_at(c[key], c["gt_brain"], c["gt_sum"], thr)
                         for c in test_cache
@@ -324,8 +328,8 @@ if __name__ == "__main__":
                         help="T_INT values to sweep.")
     parser.add_argument("--ddim-steps",  type=int,   nargs="+", default=[25, 50, 100],
                         help="DDIM step counts to sweep (actual steps in [0, t_int]).")
-    parser.add_argument("--percentiles", type=float, nargs="+", default=[97, 98, 99, 99.5],
-                        help="Threshold percentiles to sweep.")
+    parser.add_argument("--percentiles", type=float, nargs="+", default=[90, 93, 95, 97, 98, 99],
+                        help="Threshold percentiles to sweep (voxel-level FPR).")
     parser.add_argument("--fusion",      choices=["off", "on", "both"], default="both",
                         help="Latent-fusion modes to evaluate (default: both).")
     parser.add_argument("--n-images",    type=int,   default=200,
