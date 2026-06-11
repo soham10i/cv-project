@@ -34,6 +34,10 @@ MASKS_DIR       = PROCESSED_DIR / "test_masks"
 BASELINE_PATH    = PROCESSED_DIR / "M_baseline.npy"
 CALIBRATION_PATH = PROCESSED_DIR / "calibration.json"
 
+# Multi-timestep calibration artefacts (one M_baseline per T_int level).
+MULTI_BASELINE_PATH    = PROCESSED_DIR / "M_baseline_multi.npz"
+MULTI_CALIBRATION_PATH = PROCESSED_DIR / "calibration_multi.json"
+
 SPLITS_DIR = PROJECT_ROOT / "splits"
 
 MODEL_DIR    = _path("CV_MODEL_DIR",   PROJECT_ROOT / "model")
@@ -75,6 +79,26 @@ DDIM_STEPS = 50
 # Intermediate noise level for partial-noise reconstruction — shared by
 # training-calibration, evaluation, and visualisation.
 T_INT = 300
+
+# ─────────────────────────────────────────────
+# Multi-timestep residual aggregation (evaluation-time; no UNet retraining)
+# ─────────────────────────────────────────────
+# A subtle, low-contrast lesion is effectively "noised out" at a low T (the
+# model happily reconstructs healthy tissue in its place → large residual),
+# whereas a massive, high-contrast lesion still retains structural remnants at
+# a high T (the model reconstructs the lesion → suppressed residual).  A single
+# fixed T_INT therefore cannot expose both regimes.  When USE_MULTI_T is on,
+# the anomaly score is computed at each T in MULTI_T_LIST and aggregated, so the
+# map captures both fine texture anomalies and large structural deformities.
+#
+# This is calibration + inference only (run src/recalibrate.py) — the UNet is
+# NOT retrained.
+USE_MULTI_T  = True
+MULTI_T_LIST = [100, 250, 400]
+# How per-T (healthy-scale-standardised) score maps are combined:
+#   "mean" → smoother, fewer false positives (default)
+#   "max"  → most sensitive; flags a voxel anomalous at ANY noise level
+MULTI_T_AGG  = "mean"
 
 # ─────────────────────────────────────────────
 # SAAM (Self-Attention Attribution Maps)

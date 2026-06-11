@@ -57,7 +57,14 @@ log = logging.getLogger(__name__)
 # Helper functions
 # ─────────────────────────────────────────────
 def zscore_normalize_slice(slice_2d: np.ndarray) -> np.ndarray:
-    """Z-score normalizes a 2D slice on non-zero (brain) voxels; background stays 0."""
+    """Z-score normalizes a 2D slice on non-zero (brain) voxels; background stays 0.
+
+    DEPRECATED for the extraction pipeline — per-slice statistics destroy the
+    relative intensity relationships across the Z-axis (a slice containing a
+    large hyper-intense lesion inflates its own mean, pushing the surrounding
+    healthy tissue to anomalously low values).  Use ``zscore_normalize_volume``
+    instead.  Kept only for backward compatibility / ad-hoc use.
+    """
     out = np.zeros_like(slice_2d, dtype=np.float32)
     brain_mask = slice_2d > 0
 
@@ -65,6 +72,33 @@ def zscore_normalize_slice(slice_2d: np.ndarray) -> np.ndarray:
         return out
 
     brain_voxels = slice_2d[brain_mask].astype(np.float32)
+    mean = brain_voxels.mean()
+    std  = brain_voxels.std()
+
+    if std < 1e-8:
+        return out
+
+    out[brain_mask] = (brain_voxels - mean) / std
+    return out
+
+
+def zscore_normalize_volume(volume_3d: np.ndarray) -> np.ndarray:
+    """Z-score normalize a 3D volume using statistics pooled over ALL non-zero
+    (brain) voxels in the volume; background stays exactly 0.
+
+    Volume-level (rather than per-slice) normalization is the BraTS standard and
+    preserves the relative intensity gradients across the Z-axis: the same
+    tissue keeps the same normalized value regardless of which slice it appears
+    in, and a slice that happens to contain a large hyper-intense lesion no
+    longer distorts the normalization of the healthy tissue around it.
+    """
+    out = np.zeros_like(volume_3d, dtype=np.float32)
+    brain_mask = volume_3d > 0
+
+    if not np.any(brain_mask):
+        return out
+
+    brain_voxels = volume_3d[brain_mask].astype(np.float32)
     mean = brain_voxels.mean()
     std  = brain_voxels.std()
 
@@ -187,12 +221,20 @@ def preprocess(
             continue
         seg_vol = load_nifti(seg_path)
 
+        # Volume-level z-score: compute each modality's brain statistics ONCE
+        # over the whole 3D volume, so every extracted slice shares a single,
+        # lesion-independent intensity scale (see zscore_normalize_volume).
+        normed_volumes = [zscore_normalize_volume(vol) for vol in volumes]
+
         depth = volumes[0].shape[2]
 
         for z in range(depth):
             if healthy_count >= max_healthy and anomalous_count >= max_anomalous:
                 break
 
+            # Brain footprint is determined from the RAW intensities (> 0); the
+            # z-scored volume can be negative inside the brain, so it must not be
+            # used for the foreground test.
             mod_slices = [vol[:, :, z] for vol in volumes]
             seg_slice  = seg_vol[:, :, z]
 
@@ -201,7 +243,7 @@ def preprocess(
             if brain_any.sum() / total_area < C.MIN_BRAIN_FRAC:
                 continue
 
-            normed = [zscore_normalize_slice(s) for s in mod_slices]
+            normed = [nv[:, :, z] for nv in normed_volumes]
             stacked = np.stack(normed, axis=0)
             stacked_padded = symmetric_pad(stacked, C.TARGET_SIZE)
             seg_padded     = symmetric_pad(seg_slice, C.TARGET_SIZE)
