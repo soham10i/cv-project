@@ -535,3 +535,215 @@ def load_calibration(baseline_path: Path = C.BASELINE_PATH,
         with open(calib_path) as f:
             calib = json.load(f)
     return m_baseline, calib
+
+
+# ═════════════════════════════════════════════
+# Multi-timestep residual aggregation
+# ═════════════════════════════════════════════
+#
+# Rationale: lesions of different size/contrast become "reconstructable" (and so
+# stop producing a residual) at different noise levels T_int.  Scoring at a
+# single T_int therefore misses part of the lesion spectrum.  Here the anomaly
+# score is computed at several T_int levels and aggregated.  Every T level has
+# its OWN healthy baseline + healthy scale so the per-T maps are standardised
+# before aggregation and the percentile threshold stays meaningful — this is
+# the same calibration contract as the single-T path, just per level.
+#
+# Cost: N× the reconstruction passes (one per T) at calibration AND inference.
+# The UNet is NOT retrained.
+
+def aggregate_t_scores(score_stack: np.ndarray, mode: str = C.MULTI_T_AGG) -> np.ndarray:
+    """Aggregate a ``(T, H, W)`` stack of standardised score maps → ``(H, W)``.
+
+    ``mode="mean"`` averages (smoother, fewer FPs); ``mode="max"`` takes the
+    voxel-wise maximum (most sensitive — anomalous at ANY level wins).
+    """
+    if mode == "max":
+        return score_stack.max(axis=0)
+    return score_stack.mean(axis=0)
+
+
+@torch.no_grad()
+def reconstruct_and_score_t(vae, unet, ddim, image, t_int, ddim_steps,
+                            m_baseline, pixel_scale, latent_scale, alpha,
+                            use_fusion, generator=None):
+    """Single-T, healthy-scale-standardised anomaly score for one image.
+
+    Parameters mirror one entry of the multi-T calibration.  Returns
+    ``(score_2d (H,W), brain_mask_2d (H,W), recon_np (3,H,W))`` — the recon is
+    returned so callers can reuse it for visualisation without recomputing.
+    """
+    timesteps = inference_timesteps(ddim, t_int, ddim_steps)
+    orig_norm, recon, z0, z_den = reconstruct_healthy(
+        vae, unet, ddim, image, timesteps, t_int, generator)
+
+    orig_np  = orig_norm[0].cpu().numpy()
+    recon_np = recon[0].cpu().numpy()
+    bmask    = brain_mask_2d(orig_np)
+    m_pixel  = pixel_residual_2d(orig_np, recon_np, m_baseline, bmask)
+
+    if use_fusion:
+        m_latent = latent_residual_2d(z0, z_den) * bmask
+        score = fuse_maps(m_pixel, m_latent, pixel_scale, latent_scale, alpha)
+    else:
+        # Standardise by the healthy pixel scale so every T contributes on a
+        # comparable magnitude before aggregation.
+        score = m_pixel / (pixel_scale + 1e-8)
+    return score, bmask, recon_np
+
+
+@torch.no_grad()
+def score_image_multi_t(vae, unet, ddim, image, baselines: dict, calib: dict,
+                        generator=None):
+    """Aggregated multi-T anomaly score for one ``(1, 3, H, W)`` image.
+
+    ``baselines`` maps ``t_int -> M_baseline (3,H,W)``; ``calib`` is the dict
+    produced by :func:`calibrate_on_healthy_multi_t`.  Returns
+    ``(agg_score (H,W), brain_mask (H,W), recon_repr (3,H,W))`` where the
+    representative recon is taken at the middle T (for visualisation only).
+    """
+    t_list      = [int(t) for t in calib["t_list"]]
+    use_fusion  = bool(calib["use_fusion"])
+    alpha       = float(calib["alpha"])
+    ddim_steps  = int(calib["ddim_steps"])
+    agg_mode    = calib.get("agg", C.MULTI_T_AGG)
+
+    stack, bmask, recon_repr = [], None, None
+    repr_idx = len(t_list) // 2
+    for i, t in enumerate(t_list):
+        scales = calib["per_t"][str(t)]
+        score_t, bmask, recon_np = reconstruct_and_score_t(
+            vae, unet, ddim, image, t, ddim_steps, baselines[t],
+            scales["pixel_scale"], scales["latent_scale"], alpha,
+            use_fusion, generator)
+        stack.append(score_t)
+        if i == repr_idx:
+            recon_repr = recon_np
+
+    agg_score = aggregate_t_scores(np.stack(stack, axis=0), agg_mode)
+    return agg_score, bmask, recon_repr
+
+
+@torch.no_grad()
+def calibrate_on_healthy_multi_t(vae, unet, val_loader, device, *,
+                                 t_list=None, ddim_steps: int = C.DDIM_STEPS,
+                                 max_samples: int = C.MAX_CAL_SAMPLES,
+                                 percentile: float = C.THRESHOLD_PERCENTILE,
+                                 alpha: float = C.LATENT_FUSION_ALPHA,
+                                 agg_mode: str = C.MULTI_T_AGG,
+                                 use_fusion: bool = C.USE_LATENT_FUSION,
+                                 generator: torch.Generator | None = None):
+    """Multi-T healthy calibration.
+
+    For every T in ``t_list`` computes its own ``M_baseline`` and healthy
+    pixel/latent scales, then derives ONE operating threshold from the pooled
+    distribution of the *aggregated* healthy score (so the threshold matches the
+    aggregated map used at inference).
+
+    Returns ``(baselines, calib)`` where ``baselines`` maps ``t_int -> (3,H,W)``.
+    """
+    t_list = [int(t) for t in (t_list if t_list is not None else C.MULTI_T_LIST)]
+    ddim = make_ddim_scheduler()
+    unet.eval(); vae.eval()
+
+    # ── Pass 1: per-T M_baseline + cache (raw_diff, latent, brain_mask) ──
+    cache: dict[int, list] = {t: [] for t in t_list}
+    resid_sum: dict[int, np.ndarray | None] = {t: None for t in t_list}
+    n_samples = 0
+
+    for images in val_loader:
+        if n_samples >= max_samples:
+            break
+        images = images.to(device)
+        bs = images.shape[0]
+        for t in t_list:
+            timesteps = inference_timesteps(ddim, t, ddim_steps)
+            orig_norm, recon, z0, z_den = reconstruct_healthy(
+                vae, unet, ddim, images, timesteps, t, generator)
+            orig_np  = orig_norm.cpu().numpy()
+            recon_np = recon.cpu().numpy()
+            for b in range(bs):
+                raw_diff = np.abs(orig_np[b] - recon_np[b])          # (3,H,W)
+                resid_sum[t] = raw_diff.copy() if resid_sum[t] is None \
+                    else resid_sum[t] + raw_diff
+                cache[t].append((
+                    raw_diff,
+                    latent_residual_2d(z0[b:b+1], z_den[b:b+1]),
+                    brain_mask_2d(orig_np[b]),
+                ))
+        n_samples += bs
+
+    if n_samples == 0:
+        raise RuntimeError("Calibration set is empty.")
+    n_cached = len(cache[t_list[0]])
+    baselines = {t: (resid_sum[t] / n_cached).astype(np.float32) for t in t_list}
+
+    # ── Pass 2: per-T standardised maps + scales ────────────────────────
+    masks = [bm > 0 for (_, _, bm) in cache[t_list[0]]]
+    pixel_maps: dict[int, list] = {t: [] for t in t_list}
+    latent_maps: dict[int, list] = {t: [] for t in t_list}
+    scales: dict[int, tuple] = {}
+    for t in t_list:
+        for raw_diff, lat_2d, bmask in cache[t]:
+            pm = np.clip(raw_diff - baselines[t], 0, None).mean(axis=0) * bmask
+            pixel_maps[t].append(pm)
+            latent_maps[t].append(lat_2d * bmask)
+        ps = float(np.mean([m[m > 0].mean() if np.any(m > 0) else 0.0
+                            for m in pixel_maps[t]])) or 1.0
+        ls = float(np.mean([m[m > 0].mean() if np.any(m > 0) else 0.0
+                            for m in latent_maps[t]])) or 1.0
+        scales[t] = (ps, ls)
+
+    # ── Pass 3: aggregated healthy score → percentile threshold ─────────
+    agg_voxels = []
+    for i in range(n_cached):
+        stack = []
+        for t in t_list:
+            ps, ls = scales[t]
+            if use_fusion:
+                s = fuse_maps(pixel_maps[t][i], latent_maps[t][i], ps, ls, alpha)
+            else:
+                s = pixel_maps[t][i] / (ps + 1e-8)
+            stack.append(s)
+        agg = aggregate_t_scores(np.stack(stack, axis=0), agg_mode)
+        agg_voxels.append(agg[masks[i]])
+    agg_voxels = np.concatenate(agg_voxels)
+
+    calib = {
+        "multi_t": True,
+        "t_list": t_list,
+        "ddim_steps": int(ddim_steps),
+        "agg": agg_mode,
+        "percentile": float(percentile),
+        "use_fusion": bool(use_fusion),
+        "alpha": float(alpha),
+        "n_samples": int(n_cached),
+        # Operating threshold for the AGGREGATED multi-T score:
+        "threshold": float(np.percentile(agg_voxels, percentile)),
+        "per_t": {str(t): {"pixel_scale": scales[t][0],
+                           "latent_scale": scales[t][1]} for t in t_list},
+    }
+    return baselines, calib
+
+
+def save_calibration_multi_t(baselines: dict, calib: dict,
+                             baseline_path: Path = C.MULTI_BASELINE_PATH,
+                             calib_path: Path = C.MULTI_CALIBRATION_PATH) -> None:
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    # Keys must be strings for np.savez; prefix with 't' to keep them valid.
+    np.savez(baseline_path, **{f"t{t}": b for t, b in baselines.items()})
+    with open(calib_path, "w") as f:
+        json.dump(calib, f, indent=2)
+
+
+def load_calibration_multi_t(baseline_path: Path = C.MULTI_BASELINE_PATH,
+                             calib_path: Path = C.MULTI_CALIBRATION_PATH):
+    """Returns ``(baselines {t:int -> (3,H,W)}, calib_dict)`` or ``(None, None)``
+    if the multi-T calibration artefacts are absent."""
+    if not (Path(baseline_path).exists() and Path(calib_path).exists()):
+        return None, None
+    data = np.load(baseline_path)
+    baselines = {int(k[1:]): data[k].astype(np.float32) for k in data.files}
+    with open(calib_path) as f:
+        calib = json.load(f)
+    return baselines, calib

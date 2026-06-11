@@ -116,9 +116,33 @@ def evaluate(args):
 
     unet = utils.load_unet(device)
 
-    # ── Calibration (baseline + threshold + scales) ──────────────
-    m_baseline, calib = utils.load_calibration()
-    log.info("M_baseline loaded: shape %s, mean %.4f", m_baseline.shape, m_baseline.mean())
+    # ── Multi-timestep calibration (optional; no UNet retraining) ─────
+    # When enabled (and present), the anomaly score is aggregated across several
+    # T_int levels.  --t-int on the CLI forces the single-T path for ad-hoc runs.
+    use_multi_t = C.USE_MULTI_T and args.t_int is None
+    multi_baselines = multi_calib = None
+    if use_multi_t:
+        multi_baselines, multi_calib = utils.load_calibration_multi_t()
+        if multi_calib is None:
+            log.warning("USE_MULTI_T is on but no multi-T calibration found (%s). "
+                        "Run src/recalibrate.py. Falling back to single-T.",
+                        C.MULTI_CALIBRATION_PATH)
+            use_multi_t = False
+        else:
+            log.info("MULTI-T eval | T_list=%s | agg=%s | threshold=%.4f | fusion=%s",
+                     multi_calib["t_list"], multi_calib["agg"],
+                     multi_calib["threshold"], multi_calib["use_fusion"])
+
+    # ── Single-T calibration (baseline + threshold + scales) ─────────
+    # Always attempt to load it: it drives the single-T path and supplies the
+    # seg-grid range.  Tolerate absence only when multi-T is active.
+    try:
+        m_baseline, calib = utils.load_calibration()
+        log.info("M_baseline loaded: shape %s, mean %.4f", m_baseline.shape, m_baseline.mean())
+    except FileNotFoundError:
+        if not use_multi_t:
+            raise
+        m_baseline, calib = None, None
 
     # The threshold in calibration.json is ONLY valid for the T_int/steps it was
     # computed at.  Default eval to those so the two can never silently diverge;
@@ -146,7 +170,7 @@ def evaluate(args):
         log.info("Calibration: thr_pixel %.4f | thr_fused %.4f | fusion=%s",
                  thr_pixel, thr_fused, use_fusion)
     else:
-        log.warning("No calibration.json — falling back to per-image Otsu threshold.")
+        log.warning("No single-T calibration.json — relying on multi-T calibration.")
         thr_pixel = thr_fused = None
         pixel_scale = latent_scale = 1.0
         alpha = C.LATENT_FUSION_ALPHA
@@ -166,7 +190,7 @@ def evaluate(args):
     # grid always covers the anomalous score region.  Fused scores are
     # standardised (pixel/scale + α·latent/scale) and can reach 5–10+ for
     # clear lesions; the old hardcoded [0.005, 1.0] grid was far too narrow.
-    op_thr = thr_fused if use_fusion else thr_pixel
+    op_thr = multi_calib["threshold"] if use_multi_t else (thr_fused if use_fusion else thr_pixel)
     if op_thr is None:
         op_thr = 0.5
     seg_grid = make_seg_grid(max(op_thr * 40, 1.0))
@@ -187,43 +211,55 @@ def evaluate(args):
 
         # SAAM is only needed for the (capped) saved figures, and the manual
         # attention path is ~3× slower — so only hook attention when plotting.
+        # SAAM applies to the single-T path only; multi-T aggregates several
+        # reconstructions and skips the per-step attention capture.
         want_plot = i < args.max_plots
-        attn_stores = utils.install_attn_hooks(unet) if want_plot else None
 
-        # 1. Encode (deterministic) → noise @ T_int → DDIM denoise ──────────
-        z0 = utils.encode_to_latents(vae, image, sample=False)
-        noise = torch.randn(z0.shape, device=device, generator=generator)
-        t_tensor = torch.tensor([args.t_int], device=device, dtype=torch.long)
-        z_noisy = ddim.add_noise(z0, noise, t_tensor)
-
-        attn_accum = np.zeros((C.TARGET_SIZE, C.TARGET_SIZE), dtype=np.float32)
-        n_steps = 0
-        for t in timesteps:
-            noise_pred = unet(z_noisy, t).sample
-            z_noisy = ddim.step(noise_pred, t, z_noisy).prev_sample
-            if want_plot:
-                attn_accum += utils.aggregate_step_attention(attn_stores)
-                n_steps += 1
-        a_total = attn_accum / max(n_steps, 1)
-        z_den = z_noisy
-        if want_plot:
-            utils.restore_default_processors(unet)
-
-        # 2. Decode + residual scoring ───────────────────────────────
-        recon = vae.decode(z_den / C.SCALING_FACTOR).sample
-        orig_np  = utils.normalize_for_vae(image)[0].cpu().numpy()   # (3,256,256)
-        recon_np = recon[0].cpu().numpy()
-
-        bmask   = utils.brain_mask_2d(orig_np)
-        m_pixel = utils.pixel_residual_2d(orig_np, recon_np, m_baseline, bmask)
-
-        if use_fusion:
-            m_latent = utils.latent_residual_2d(z0, z_den) * bmask
-            score = utils.fuse_maps(m_pixel, m_latent, pixel_scale, latent_scale, alpha)
-            thr = thr_fused
+        if use_multi_t:
+            # 1–2. Aggregated multi-T anomaly score (no UNet retraining) ──────
+            score, bmask, recon_np = utils.score_image_multi_t(
+                vae, unet, ddim, image, multi_baselines, multi_calib, generator)
+            orig_np = utils.normalize_for_vae(image)[0].cpu().numpy()
+            thr = multi_calib["threshold"]
+            a_total = np.zeros((C.TARGET_SIZE, C.TARGET_SIZE), dtype=np.float32)
+            z0 = z_noisy = z_den = noise = recon = None
         else:
-            score = m_pixel
-            thr = thr_pixel
+            attn_stores = utils.install_attn_hooks(unet) if want_plot else None
+
+            # 1. Encode (deterministic) → noise @ T_int → DDIM denoise ──────────
+            z0 = utils.encode_to_latents(vae, image, sample=False)
+            noise = torch.randn(z0.shape, device=device, generator=generator)
+            t_tensor = torch.tensor([args.t_int], device=device, dtype=torch.long)
+            z_noisy = ddim.add_noise(z0, noise, t_tensor)
+
+            attn_accum = np.zeros((C.TARGET_SIZE, C.TARGET_SIZE), dtype=np.float32)
+            n_steps = 0
+            for t in timesteps:
+                noise_pred = unet(z_noisy, t).sample
+                z_noisy = ddim.step(noise_pred, t, z_noisy).prev_sample
+                if want_plot:
+                    attn_accum += utils.aggregate_step_attention(attn_stores)
+                    n_steps += 1
+            a_total = attn_accum / max(n_steps, 1)
+            z_den = z_noisy
+            if want_plot:
+                utils.restore_default_processors(unet)
+
+            # 2. Decode + residual scoring ───────────────────────────────
+            recon = vae.decode(z_den / C.SCALING_FACTOR).sample
+            orig_np  = utils.normalize_for_vae(image)[0].cpu().numpy()   # (3,256,256)
+            recon_np = recon[0].cpu().numpy()
+
+            bmask   = utils.brain_mask_2d(orig_np)
+            m_pixel = utils.pixel_residual_2d(orig_np, recon_np, m_baseline, bmask)
+
+            if use_fusion:
+                m_latent = utils.latent_residual_2d(z0, z_den) * bmask
+                score = utils.fuse_maps(m_pixel, m_latent, pixel_scale, latent_scale, alpha)
+                thr = thr_fused
+            else:
+                score = m_pixel
+                thr = thr_pixel
 
         # 3. Metrics (over brain voxels) ─────────────────────────────
         brain_flat = bmask.flatten() > 0
@@ -309,6 +345,10 @@ def evaluate(args):
         "global_best_dice_mean": global_best_dice,
         "calibrated_thr_pixel": thr_pixel,
         "fusion": use_fusion,
+        "multi_t": use_multi_t,
+        "multi_t_list": multi_calib["t_list"] if use_multi_t else None,
+        "multi_t_agg": multi_calib["agg"] if use_multi_t else None,
+        "multi_t_threshold": multi_calib["threshold"] if use_multi_t else None,
         "t_int": args.t_int,
         "per_image": per_image,
     }

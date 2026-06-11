@@ -55,6 +55,38 @@ def main():
     dataset = HealthySliceDataset(cal_dir)
     loader  = DataLoader(dataset, batch_size=8, shuffle=False, num_workers=0)
 
+    # ── Multi-timestep calibration (no UNet retraining) ──────────────
+    if C.USE_MULTI_T:
+        log.info("MULTI-T calibration | T_list=%s | agg=%s | DDIM_STEPS=%d | "
+                 "p%.0f | fusion=%s",
+                 C.MULTI_T_LIST, C.MULTI_T_AGG, C.DDIM_STEPS,
+                 C.THRESHOLD_PERCENTILE, C.USE_LATENT_FUSION)
+        baselines, calib = utils.calibrate_on_healthy_multi_t(
+            vae, unet, loader, device,
+            t_list=C.MULTI_T_LIST,
+            ddim_steps=C.DDIM_STEPS,
+            max_samples=C.MAX_CAL_SAMPLES,
+            percentile=C.THRESHOLD_PERCENTILE,
+            agg_mode=C.MULTI_T_AGG,
+            use_fusion=C.USE_LATENT_FUSION,
+            generator=generator,
+        )
+        utils.save_calibration_multi_t(baselines, calib)
+        log.info("=" * 55)
+        log.info("MULTI-T calibration saved:")
+        for t in calib["t_list"]:
+            log.info("  T=%-4d  M_baseline mean %.6f | pixel_scale %.4f | latent_scale %.4f",
+                     t, baselines[t].mean(),
+                     calib["per_t"][str(t)]["pixel_scale"],
+                     calib["per_t"][str(t)]["latent_scale"])
+        log.info("  aggregated threshold (p%.0f): %.4f",
+                 C.THRESHOLD_PERCENTILE, calib["threshold"])
+        log.info("  n_samples         : %d", calib["n_samples"])
+        log.info("  Baselines → %s", C.MULTI_BASELINE_PATH)
+        log.info("  Calib     → %s", C.MULTI_CALIBRATION_PATH)
+        log.info("=" * 55)
+        return
+
     log.info("Calibrating with T_INT=%d | DDIM_STEPS=%d | p%.0f | fusion=%s",
              C.T_INT, C.DDIM_STEPS, C.THRESHOLD_PERCENTILE, C.USE_LATENT_FUSION)
 
