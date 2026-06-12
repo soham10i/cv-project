@@ -16,3 +16,9 @@ scikit-learn==1.9.0
 nibabel==5.4.2
 matplotlib==3.10.9
 tqdm==4.68.1
+
+# VAE fine-tuning (train_vae.py): perceptual loss + scalar dashboards.
+# Both are optional at runtime — train_vae degrades gracefully if absent —
+# but pinned here for the full pipeline.
+lpips==0.1.4
+tensorboard==2.20.0

@@ -38,15 +38,27 @@ CALIBRATION_PATH = PROCESSED_DIR / "calibration.json"
 MULTI_BASELINE_PATH    = PROCESSED_DIR / "M_baseline_multi.npz"
 MULTI_CALIBRATION_PATH = PROCESSED_DIR / "calibration_multi.json"
 
+# VAE fine-tuning datasets — ALL slices (healthy + lesion), patient-disjoint.
+# The VAE is a *codec*: it must reconstruct lesions faithfully, so unlike the
+# diffusion stage it is trained on every slice, not healthy-only.
+VAE_TRAIN_DIR     = PROCESSED_DIR / "vae_train"
+VAE_VAL_DIR       = PROCESSED_DIR / "vae_val"
+VAE_VAL_MASKS_DIR = PROCESSED_DIR / "vae_val_masks"   # lesion masks for val fidelity
+
 SPLITS_DIR = PROJECT_ROOT / "splits"
 
 MODEL_DIR    = _path("CV_MODEL_DIR",   PROJECT_ROOT / "model")
 UNET_DIR     = MODEL_DIR / "unet"
 UNET_EMA_DIR = MODEL_DIR / "unet_ema"
+VAE_FT_DIR   = MODEL_DIR / "vae_ft"      # fine-tuned medical VAE (train_vae.py output)
 
 RESULTS_DIR   = _path("CV_RESULTS_DIR", PROJECT_ROOT / "results")
 TRAJ_DIR      = RESULTS_DIR / "trajectory"
 TRAIN_LOG_DIR = RESULTS_DIR / "train_logs"
+
+# Unified per-run logs: logs/<stage>_<timestamp>/  (run.log, metrics.csv/jsonl,
+# config_snapshot.json, tensorboard/).  See logkit.RunLogger.
+LOG_DIR = _path("CV_LOG_DIR", PROJECT_ROOT / "logs")
 
 # ─────────────────────────────────────────────
 # Data / preprocessing
@@ -65,6 +77,30 @@ SCALING_FACTOR = 0.18215
 # SD VAE expects inputs in ~[-1, 1]; z-scored slices are clipped to ±VAE_CLIP
 # and linearly mapped onto that range before encoding.
 VAE_CLIP = 3.0
+
+# ── VAE fine-tuning (train_vae.py) ───────────────────────────────────
+# A natural-image VAE blurs lesion texture; fine-tuning the pretrained codec on
+# BraTS (ALL slices) keeps it a *faithful* reconstructor while preserving the
+# 4ch / 32×32 latent geometry, so the diffusion UNet stays unchanged.  Loss is
+# L1 + λ_lpips·LPIPS (Zhang et al. 2018) + λ_kl·KL (Rombach et al. 2022, LDM).
+USE_FINETUNED_VAE = False   # flip True once train_vae.py has populated VAE_FT_DIR
+VAE_FT_LR         = 1e-5    # low LR — we are adapting, not retraining from scratch
+VAE_FT_EPOCHS     = 30
+VAE_FT_BATCH      = 4
+VAE_KL_WEIGHT     = 1e-6
+VAE_LPIPS_WEIGHT  = 0.1
+VAE_FT_VAL_EVERY  = 1       # run validation every N epochs
+VAE_FT_XAI_EVERY  = 5       # save reconstruction/explainability panels every N epochs
+
+
+def resolve_vae_source() -> str:
+    """Return the VAE checkpoint the downstream (diffusion) stage should load:
+    the locally fine-tuned medical codec when requested and present, otherwise
+    the pretrained Hugging Face codec.  Keeps a single switch (USE_FINETUNED_VAE)
+    in charge of which VAE the whole pipeline runs on."""
+    if USE_FINETUNED_VAE and (VAE_FT_DIR / "config.json").exists():
+        return str(VAE_FT_DIR)
+    return VAE_CKPT
 
 # ─────────────────────────────────────────────
 # Diffusion
@@ -132,3 +168,13 @@ LATENT_FUSION_ALPHA = 0.5
 # Reproducibility
 # ─────────────────────────────────────────────
 SEED = 42
+
+
+def snapshot() -> dict:
+    """Serialisable dict of the public config constants — written into every run
+    directory (config_snapshot.json) so any logged result is fully reproducible."""
+    out = {}
+    for k, v in sorted(globals().items()):
+        if k.isupper() and not k.startswith("_"):
+            out[k] = str(v) if isinstance(v, Path) else v
+    return out

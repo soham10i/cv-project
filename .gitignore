@@ -5,6 +5,9 @@ __pycache__/
 data/processed/
 cv_project/data/BraTS-PEDs-v1
 
-# extensions 
+# extensions
 *.safetensors
 .env
+
+# Unified per-run training logs (run.log, metrics.csv/jsonl, tensorboard/, xai/)
+logs/
