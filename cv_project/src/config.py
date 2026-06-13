@@ -87,7 +87,8 @@ USE_FINETUNED_VAE = False   # flip True once train_vae.py has populated VAE_FT_D
 VAE_FT_LR         = 1e-5    # low LR — we are adapting, not retraining from scratch
 VAE_FT_EPOCHS     = 30
 VAE_FT_BATCH      = 4
-VAE_KL_WEIGHT     = 1e-6
+VAE_KL_WEIGHT     = 1e-7    # gentle regulariser — at 1e-6 the raw SD-VAE KL (~6e4)
+                           # dominated the loss; 1e-7 lets L1+LPIPS drive reconstruction
 VAE_LPIPS_WEIGHT  = 0.1
 VAE_FT_VAL_EVERY  = 1       # run validation every N epochs
 VAE_FT_XAI_EVERY  = 5       # save reconstruction/explainability panels every N epochs
