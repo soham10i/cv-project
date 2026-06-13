@@ -18,10 +18,10 @@
 #   MAX_HEALTHY MAX_ANOMALOUS VAL_HEALTHY VAE_TOTAL VAE_PER_PATIENT
 #   VAE_EPOCHS VAE_BS DIFF_EPOCHS DIFF_BS LR CAL_EVERY  PYTHON  CV_RAW_DIR
 #
-# NOTE on the fine-tuned VAE: Stage 2 currently loads the *pretrained* VAE.
-#   To run diffusion on the fine-tuned codec produced by Stage 1, the diffusion/
-#   calibrate/evaluate scripts must call config.resolve_vae_source() and you must
-#   set USE_FINETUNED_VAE = True  (that is the pending "Stage 2 wiring").
+# Fine-tuned VAE: after Stage 1, CV_USE_FINETUNED_VAE=1 is exported below so the
+#   diffusion / calibrate / evaluate stages load the fine-tuned codec via
+#   config.resolve_vae_source().  Set USE_FT_VAE=0 to keep the pretrained VAE
+#   (e.g. for the baseline arm of the ablation).
 # NOTE on precision: the project is fp32 (no AMP) for portability/correctness.
 #   Mixed precision can be added later for throughput once results are validated.
 # ============================================================================
@@ -82,6 +82,11 @@ echo ">>> [3/7] VAE dataset (all slices: healthy + lesion)"
 echo ">>> [4/7] Stage 1 — VAE fine-tune (L1 + LPIPS + KL)"
 "$PY" train_vae.py --epochs "$VAE_EPOCHS" --bs "$VAE_BS" --grad-accum "$VAE_ACCUM" \
       --num-workers "$NUM_WORKERS" $RESUME_FLAG
+
+# Switch the downstream stages onto the fine-tuned codec (resolve_vae_source()).
+USE_FT_VAE="${USE_FT_VAE:-1}"
+export CV_USE_FINETUNED_VAE="$USE_FT_VAE"
+echo "    CV_USE_FINETUNED_VAE=$CV_USE_FINETUNED_VAE (diffusion/calib/eval VAE source)"
 
 echo ">>> [5/7] Stage 2 — diffusion train + calibrate"
 "$PY" train_healthy_manifold.py --epochs "$DIFF_EPOCHS" --bs "$DIFF_BS" \

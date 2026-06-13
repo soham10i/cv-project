@@ -83,7 +83,10 @@ VAE_CLIP = 3.0
 # BraTS (ALL slices) keeps it a *faithful* reconstructor while preserving the
 # 4ch / 32×32 latent geometry, so the diffusion UNet stays unchanged.  Loss is
 # L1 + λ_lpips·LPIPS (Zhang et al. 2018) + λ_kl·KL (Rombach et al. 2022, LDM).
-USE_FINETUNED_VAE = False   # flip True once train_vae.py has populated VAE_FT_DIR
+USE_FINETUNED_VAE = os.environ.get("CV_USE_FINETUNED_VAE", "0") == "1"
+# ↑ Set CV_USE_FINETUNED_VAE=1 (or edit to True) once train_vae.py has populated
+#   VAE_FT_DIR, so the diffusion / calibration / evaluation stages load the
+#   fine-tuned medical codec via resolve_vae_source().
 VAE_FT_LR         = 1e-5    # low LR — we are adapting, not retraining from scratch
 VAE_FT_EPOCHS     = 30
 VAE_FT_BATCH      = 4

@@ -80,8 +80,12 @@ tensorboard --logdir logs/
 ## Current state
 
 - Active branch: **`version-3`** (draft PR #7 → `main`).
-- **Stage 1 (VAE fine-tuning) complete & validated.** Stage 2 (rewire the
-  fine-tuned VAE into diffusion) is **pending**.
+- **Stage 1 (VAE fine-tuning) complete & validated** (smoke-passed on T4).
+- **Stage 2 wiring complete**: diffusion / recalibrate / evaluate load the VAE via
+  `resolve_vae_source()` (switch with `CV_USE_FINETUNED_VAE=1` or `USE_FINETUNED_VAE`);
+  diffusion trainer now has a validation denoising loss, before/after (epoch-0 vs
+  final) SAAM XAI, and unified `logkit` logging. Pending: the full cloud training
+  runs + the pretrained-vs-fine-tuned ablation.
 
 ## Known issues / honesty notes
 
@@ -108,11 +112,12 @@ tensorboard --logdir logs/
   set `CV_MODEL_DIR` / `CV_PROCESSED_DIR` / `CV_LOG_DIR` there so checkpoints/data
   survive disconnects; re-running `run_full_cloud.sh` (RESUME=1) continues.
 
-## Next steps (Stage 2)
+## Next steps (post Stage-2-wiring)
 
-1. Load the fine-tuned VAE via `config.resolve_vae_source()` in
-   `train_healthy_manifold.py`, `recalibrate.py`, `evaluate_pipeline.py`.
-2. Add a **validation denoising loss** (fixed per-slice noise) to the diffusion
-   loop — currently only train loss is tracked.
-3. **Before/after XAI**: SAAM + residual panels at epoch 0 (random init) vs final.
-4. Route the diffusion scripts through `logkit.RunLogger`.
+1. **Full cloud runs**: VAE fine-tune → set `CV_USE_FINETUNED_VAE=1` → retrain the
+   diffusion UNet on the new latents (the UNet **must** be retrained — switching
+   the VAE changes the latent distribution) → recalibrate → evaluate.
+2. **The decisive ablation**: pretrained-VAE vs fine-tuned-VAE pipeline, same UNet
+   recipe — this is what justifies the Stage-1 effort. Report DICE / AUPRC / oracle-DICE.
+3. **Contingency levers** if the residual still under-localizes: simplex noise
+   (AnoDDPM), T_int sweep, 2.5D input, residual post-processing.

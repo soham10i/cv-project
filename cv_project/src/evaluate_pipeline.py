@@ -109,8 +109,10 @@ def evaluate(args):
     generator = utils.make_generator(device)
 
     # ── Models ───────────────────────────────────────────────────
-    log.info("Loading VAE from '%s' …", C.VAE_CKPT)
-    vae = AutoencoderKL.from_pretrained(C.VAE_CKPT).to(device)
+    vae_src = C.resolve_vae_source()
+    log.info("Loading VAE from '%s'%s …", vae_src,
+             " (fine-tuned)" if vae_src != C.VAE_CKPT else "")
+    vae = AutoencoderKL.from_pretrained(vae_src).to(device)
     vae.eval()
     vae.requires_grad_(False)
 

@@ -40,6 +40,7 @@ from diffusers import AutoencoderKL, UNet2DModel
 import config as C
 import utils
 import ckptkit
+from logkit import RunLogger
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,8 +77,10 @@ class HealthySliceDataset(Dataset):
 # Model factory
 # ─────────────────────────────────────────────
 def build_models(device):
-    log.info("Loading VAE from '%s' …", C.VAE_CKPT)
-    vae = AutoencoderKL.from_pretrained(C.VAE_CKPT)
+    vae_src = C.resolve_vae_source()
+    tag = " (fine-tuned medical codec)" if vae_src != C.VAE_CKPT else " (pretrained)"
+    log.info("Loading VAE from '%s'%s …", vae_src, tag)
+    vae = AutoencoderKL.from_pretrained(vae_src)
     vae.eval()
     vae.requires_grad_(False)
     vae = vae.to(device)
@@ -274,6 +277,34 @@ def train_one_epoch(unet, vae, scheduler, loader, optimizer, ema, device,
 
 
 # ─────────────────────────────────────────────
+# Validation denoising loss (fixed noise → comparable across epochs)
+# ─────────────────────────────────────────────
+@torch.no_grad()
+def validate_denoising(unet, vae, scheduler, val_loader, device,
+                       max_batches: int = 25) -> float:
+    """Mean ε-prediction MSE on the val set with a *fixed* noise/timestep stream
+    (re-seeded each call), so the curve is comparable epoch-to-epoch and exposes
+    the train/val generalization gap the training loss alone can't show."""
+    unet.eval()
+    g = torch.Generator(device=device).manual_seed(C.SEED)
+    total, n = 0.0, 0
+    for bi, images in enumerate(val_loader):
+        if max_batches is not None and bi >= max_batches:
+            break
+        images = images.to(device)
+        latents = utils.encode_to_latents(vae, images, sample=False)
+        bsz = latents.shape[0]
+        timesteps = torch.randint(0, scheduler.config.num_train_timesteps,
+                                  (bsz,), device=device, generator=g, dtype=torch.long)
+        noise = torch.randn(latents.shape, device=device, generator=g)
+        noisy = scheduler.add_noise(latents, noise, timesteps)
+        pred = unet(noisy, timesteps).sample
+        total += F.mse_loss(pred, noise).item()
+        n += 1
+    return total / max(n, 1)
+
+
+# ─────────────────────────────────────────────
 # Calibration on EMA weights
 # ─────────────────────────────────────────────
 @torch.no_grad()
@@ -347,6 +378,15 @@ def monitor_reconstruction(vae, unet, ema, monitor_images: torch.Tensor,
 def main(args):
     utils.set_seed()
     device = utils.get_device()
+
+    # Unified per-run logging (logs/<stage>_<ts>/): run.log + metrics.csv/jsonl + TB.
+    rl = RunLogger("diffusion", config_snapshot=C.snapshot(),
+                   use_tensorboard=not args.no_tensorboard)
+    fh = logging.FileHandler(rl.run_dir / "run.log")
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%H:%M:%S"))
+    log.addHandler(fh)                       # mirror module logs into the run folder
+
     log.info("Device: %s", device)
     generator = utils.make_generator(device)
 
@@ -417,6 +457,13 @@ def main(args):
              C.GRAD_CLIP_NORM)
     log.info("=" * 60)
 
+    # ── Before-training XAI snapshot (random-init UNet) → epoch_000 panels ──
+    if start_epoch == 1 and not args.no_xai:
+        log.info("Before-training XAI snapshot (random-init UNet) …")
+        unet.eval()
+        log_xai_panels(vae, unet, monitor_images, 0, C.TRAJ_DIR, device, generator)
+        utils.clear_cache()
+
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         avg_loss = train_one_epoch(
@@ -426,6 +473,14 @@ def main(args):
         log.info("Epoch %d/%d  —  avg loss: %.6f  —  lr %.2e  —  %.1fs",
                  epoch, args.epochs, avg_loss, lr_sched.get_last_lr()[0],
                  time.time() - t0)
+
+        # ── Validation denoising loss + unified metric logging ──────────
+        val_loss = validate_denoising(unet, vae, scheduler, val_loader, device,
+                                      max_batches=args.val_batches)
+        log.info("  val denoising loss: %.6f", val_loss)
+        rl.log_metrics(epoch, "train", {"loss": avg_loss,
+                                        "lr": lr_sched.get_last_lr()[0]})
+        rl.log_metrics(epoch, "val", {"denoise_loss": val_loss})
 
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -441,7 +496,11 @@ def main(args):
             calib, _ = calibrate_with_ema(vae, unet, ema, val_loader, device, generator)
             utils.clear_cache()
 
-            monitor_reconstruction(vae, unet, ema, monitor_images, device, generator, epoch)
+            recon = monitor_reconstruction(vae, unet, ema, monitor_images,
+                                           device, generator, epoch)
+            rl.log_metrics(epoch, "val", {"recon_mae": recon["mae"],
+                                          "recon_psnr": recon["psnr"],
+                                          "recon_ssim": recon["ssim"]})
             utils.clear_cache()
 
             # XAI panels — swap in EMA weights then restore
@@ -485,7 +544,9 @@ def main(args):
     log.info("  Calib    : %s", C.CALIBRATION_PATH)
     log.info("  XAI traj : %s", C.TRAJ_DIR)
     log.info("  Metrics  : %s", C.TRAIN_LOG_DIR)
+    log.info("  Run logs : %s", rl.run_dir)
     log.info("=" * 60)
+    rl.close()
 
 
 # ─────────────────────────────────────────────
@@ -509,6 +570,11 @@ if __name__ == "__main__":
                         help="Retain only the most recent N epoch-tagged checkpoints.")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from UNET_CKPT_DIR/last.pt if present (Colab-safe).")
+    parser.add_argument("--val-batches", type=int, default=25,
+                        help="Batches used for the validation denoising loss (default: 25).")
+    parser.add_argument("--no-xai", action="store_true",
+                        help="Skip SAAM/residual XAI panels (incl. the epoch-0 snapshot).")
+    parser.add_argument("--no-tensorboard", action="store_true")
     args = parser.parse_args()
 
     main(args)
