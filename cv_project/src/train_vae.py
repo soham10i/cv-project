@@ -48,6 +48,7 @@ from diffusers import AutoencoderKL
 
 import config as C
 import utils
+import ckptkit
 from logkit import RunLogger
 
 # ── Optional perceptual loss (graceful) ──────────────────────────────
@@ -160,25 +161,30 @@ def fidelity_ratio(orig: np.ndarray, recon: np.ndarray, bmask: np.ndarray,
 # ─────────────────────────────────────────────
 # Train / validate
 # ─────────────────────────────────────────────
-def train_one_epoch(vae, loader, optimizer, lpips_fn, device, log, epoch, total):
+def train_one_epoch(vae, loader, optimizer, lpips_fn, device, log, epoch, total,
+                    grad_accum=1):
     vae.train()
     sums, n = {"loss": 0.0, "l1": 0.0, "lpips": 0.0, "kl": 0.0}, 0
+    optimizer.zero_grad()
+    n_batches = len(loader)
     for bidx, (x, _mask, _name) in enumerate(loader):
         x = x.to(device)
         total_loss, comp, _, _ = vae_forward_loss(
             vae, x, lpips_fn, C.VAE_KL_WEIGHT, C.VAE_LPIPS_WEIGHT)
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(vae.parameters(), C.GRAD_CLIP_NORM)
-        optimizer.step()
+        # Gradient accumulation: scale so the effective batch is bs × grad_accum.
+        (total_loss / grad_accum).backward()
+        if (bidx + 1) % grad_accum == 0 or (bidx + 1) == n_batches:
+            torch.nn.utils.clip_grad_norm_(vae.parameters(), C.GRAD_CLIP_NORM)
+            optimizer.step()
+            optimizer.zero_grad()
 
         for k in sums:
             sums[k] += float(comp[k])
         n += 1
-        if (bidx + 1) % max(1, len(loader) // 4) == 0:
+        if (bidx + 1) % max(1, n_batches // 4) == 0:
             log.info("  ep %d/%d | batch %d/%d | loss %.4f (l1 %.4f, lpips %.4f, kl %.1f)",
-                     epoch, total, bidx + 1, len(loader), float(comp["loss"]),
+                     epoch, total, bidx + 1, n_batches, float(comp["loss"]),
                      float(comp["l1"]), float(comp["lpips"]), float(comp["kl"]))
     return {k: sums[k] / max(n, 1) for k in sums}
 
@@ -288,10 +294,11 @@ def main(args):
              len(train_ds), C.VAE_TRAIN_DIR.name, len(val_ds), val_dir.name)
 
     pin = device.type == "cuda"
+    nw = 0 if args.smoke else args.num_workers
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
-                              num_workers=0, pin_memory=pin)
+                              num_workers=nw, pin_memory=pin)
     val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False,
-                            num_workers=0, pin_memory=pin)
+                            num_workers=nw, pin_memory=pin)
 
     # Fixed monitor set — prefer lesion-bearing val slices for a useful overlay.
     monitor = []
@@ -340,18 +347,32 @@ def main(args):
     lr_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=C.LR_ETA_MIN)
 
+    # ── Resume (Colab/preemption safety) ─────────────────────────────
+    ckpt_dir = C.VAE_CKPT_DIR
+    start_epoch, best_val = 1, float("inf")
+    if args.resume and not args.smoke:
+        rp = ckptkit.find_resume(ckpt_dir)
+        if rp is not None:
+            ck = ckptkit.load_checkpoint(rp, model=vae, optimizer=optimizer,
+                                         scheduler=lr_sched, device=device)
+            start_epoch = int(ck["epoch"]) + 1
+            best_val = ck.get("best_metric") or float("inf")
+            log.info("Resumed from %s → epoch %d (best val %.4f)",
+                     rp, start_epoch, best_val)
+        else:
+            log.info("--resume set but no %s/last.pt found — starting fresh.", ckpt_dir)
+
     log.info("=" * 60)
-    log.info("VAE fine-tune | %d epochs | bs %d | lr %.1e | λ_lpips %.3f | λ_kl %.0e%s",
-             epochs, bs, args.lr, C.VAE_LPIPS_WEIGHT, C.VAE_KL_WEIGHT,
-             "  [SMOKE]" if args.smoke else "")
+    log.info("VAE fine-tune | %d epochs | bs %d×accum %d | lr %.1e | λ_lpips %.3f | "
+             "λ_kl %.0e%s", epochs, bs, args.grad_accum, args.lr, C.VAE_LPIPS_WEIGHT,
+             C.VAE_KL_WEIGHT, "  [SMOKE]" if args.smoke else "")
     log.info("=" * 60)
 
     # ── Loop ─────────────────────────────────────────────────────────
-    best_val = float("inf")
     train_hist = []
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         tr = train_one_epoch(vae, train_loader, optimizer, lpips_fn,
-                             device, log, epoch, epochs)
+                             device, log, epoch, epochs, grad_accum=args.grad_accum)
         lr_sched.step()
         rl.log_metrics(epoch, "train", {**tr, "lr": lr_sched.get_last_lr()[0]})
         train_hist.append(tr["loss"])
@@ -374,6 +395,18 @@ def main(args):
 
         if (epoch % args.xai_every == 0 or epoch == epochs) and not args.no_xai:
             save_xai_panels(vae, monitor, device, rl.run_dir / "xai", epoch, log)
+
+        # ── Checkpoint: resumable last.pt every epoch + periodic snapshots ──
+        if not args.smoke:
+            ckptkit.save_checkpoint(ckpt_dir / "last.pt", model=vae,
+                                    optimizer=optimizer, scheduler=lr_sched,
+                                    epoch=epoch, best_metric=best_val)
+            if epoch % args.save_every == 0 or epoch == epochs:
+                ckptkit.save_checkpoint(ckpt_dir / f"ckpt_ep{epoch:03d}.pt", model=vae,
+                                        optimizer=optimizer, scheduler=lr_sched,
+                                        epoch=epoch, best_metric=best_val)
+                ckptkit.prune_old(ckpt_dir, keep_last=args.keep_last)
+                log.info("  ↳ checkpoint @ epoch %d → %s", epoch, ckpt_dir)
         utils.clear_cache()
 
     log.info("=" * 60)
@@ -403,6 +436,16 @@ if __name__ == "__main__":
     p.add_argument("--lr", type=float, default=C.VAE_FT_LR)
     p.add_argument("--val-every", type=int, default=C.VAE_FT_VAL_EVERY)
     p.add_argument("--xai-every", type=int, default=C.VAE_FT_XAI_EVERY)
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="Gradient accumulation steps → effective batch = bs × this.")
+    p.add_argument("--num-workers", type=int, default=2,
+                   help="DataLoader workers (T4 Colab ≈ 2 vCPUs; default 2).")
+    p.add_argument("--save-every", type=int, default=C.CKPT_EVERY,
+                   help="Write an epoch-tagged checkpoint every N epochs.")
+    p.add_argument("--keep-last", type=int, default=C.CKPT_KEEP_LAST,
+                   help="Retain only the most recent N epoch-tagged checkpoints.")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from VAE_CKPT_DIR/last.pt if present (Colab-safe).")
     p.add_argument("--freeze-encoder", action="store_true",
                    help="Fine-tune the decoder only (keeps the latent space fixed).")
     p.add_argument("--no-xai", action="store_true", help="Skip explainability panels.")

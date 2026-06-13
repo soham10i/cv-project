@@ -33,18 +33,24 @@ PY="${PYTHON:-python}"
 [[ -x "$HERE/../myenv/bin/python" ]] && PY="$HERE/../myenv/bin/python"
 
 # ── full-scale defaults ─────────────────────────────────────────────────────
+# Defaults are tuned for a single 15 GB GPU (Colab T4, fp32). Bump for bigger cards.
 MAX_HEALTHY="${MAX_HEALTHY:-5000}"
 MAX_ANOMALOUS="${MAX_ANOMALOUS:-2000}"
 VAL_HEALTHY="${VAL_HEALTHY:-1000}"
 VAE_TOTAL="${VAE_TOTAL:-8000}"
 VAE_PER_PATIENT="${VAE_PER_PATIENT:-40}"
 VAE_EPOCHS="${VAE_EPOCHS:-40}"
-VAE_BS="${VAE_BS:-16}"
+VAE_BS="${VAE_BS:-4}"           # 256² activations are heavy; 4 is safe on T4 (try 8)
+VAE_ACCUM="${VAE_ACCUM:-4}"     # effective VAE batch = VAE_BS × VAE_ACCUM = 16
 DIFF_EPOCHS="${DIFF_EPOCHS:-300}"
-DIFF_BS="${DIFF_BS:-32}"
+DIFF_BS="${DIFF_BS:-16}"        # latent 32² is light; 16 safe on T4 (try 32)
+DIFF_ACCUM="${DIFF_ACCUM:-1}"
 LR="${LR:-1e-4}"
 CAL_EVERY="${CAL_EVERY:-20}"
+NUM_WORKERS="${NUM_WORKERS:-2}" # T4 Colab ≈ 2 vCPUs
+RESUME="${RESUME:-1}"           # re-running after a Colab disconnect continues
 SPLITS_DIR="${CV_SPLITS_DIR:-$HERE/splits}"
+RESUME_FLAG=""; [[ "$RESUME" == "1" ]] && RESUME_FLAG="--resume"
 
 cd "$SRC"
 
@@ -74,10 +80,13 @@ echo ">>> [3/7] VAE dataset (all slices: healthy + lesion)"
 "$PY" prepare_vae_dataset.py --max-per-patient "$VAE_PER_PATIENT" --max-total "$VAE_TOTAL"
 
 echo ">>> [4/7] Stage 1 — VAE fine-tune (L1 + LPIPS + KL)"
-"$PY" train_vae.py --epochs "$VAE_EPOCHS" --bs "$VAE_BS"
+"$PY" train_vae.py --epochs "$VAE_EPOCHS" --bs "$VAE_BS" --grad-accum "$VAE_ACCUM" \
+      --num-workers "$NUM_WORKERS" $RESUME_FLAG
 
 echo ">>> [5/7] Stage 2 — diffusion train + calibrate"
-"$PY" train_healthy_manifold.py --epochs "$DIFF_EPOCHS" --bs "$DIFF_BS" --lr "$LR" --cal-every "$CAL_EVERY"
+"$PY" train_healthy_manifold.py --epochs "$DIFF_EPOCHS" --bs "$DIFF_BS" \
+      --grad-accum "$DIFF_ACCUM" --num-workers "$NUM_WORKERS" --lr "$LR" \
+      --cal-every "$CAL_EVERY" $RESUME_FLAG
 
 echo ">>> [6/7] recalibrate (baselines + thresholds)"
 "$PY" recalibrate.py

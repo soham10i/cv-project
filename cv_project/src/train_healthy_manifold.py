@@ -39,6 +39,7 @@ from diffusers import AutoencoderKL, UNet2DModel
 
 import config as C
 import utils
+import ckptkit
 
 logging.basicConfig(
     level=logging.INFO,
@@ -230,10 +231,12 @@ def log_xai_panels(vae, unet, images: torch.Tensor, epoch: int,
 # Training loop
 # ─────────────────────────────────────────────
 def train_one_epoch(unet, vae, scheduler, loader, optimizer, ema, device,
-                    epoch, total_epochs):
+                    epoch, total_epochs, grad_accum=1):
     unet.train()
     running_loss = 0.0
     n_batches    = 0
+    n_total      = len(loader)
+    optimizer.zero_grad()
 
     for batch_idx, images in enumerate(loader):
         images = images.to(device)
@@ -252,18 +255,20 @@ def train_one_epoch(unet, vae, scheduler, loader, optimizer, ema, device,
         noise_pred = unet(noisy_latents, timesteps).sample
         loss = F.mse_loss(noise_pred, noise)
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(unet.parameters(), C.GRAD_CLIP_NORM)
-        optimizer.step()
-        ema.update(unet)
+        # Gradient accumulation → effective batch = bs × grad_accum (T4-friendly).
+        (loss / grad_accum).backward()
+        if (batch_idx + 1) % grad_accum == 0 or (batch_idx + 1) == n_total:
+            torch.nn.utils.clip_grad_norm_(unet.parameters(), C.GRAD_CLIP_NORM)
+            optimizer.step()
+            optimizer.zero_grad()
+            ema.update(unet)
 
         running_loss += loss.item()
         n_batches += 1
 
-        if (batch_idx + 1) % max(1, len(loader) // 4) == 0:
+        if (batch_idx + 1) % max(1, n_total // 4) == 0:
             log.info("  Epoch %d/%d  |  batch %d/%d  |  loss: %.6f",
-                     epoch, total_epochs, batch_idx + 1, len(loader), loss.item())
+                     epoch, total_epochs, batch_idx + 1, n_total, loss.item())
 
     return running_loss / max(n_batches, 1)
 
@@ -370,9 +375,9 @@ def main(args):
 
     pin = (device.type == "cuda")
     train_loader = DataLoader(train_ds, batch_size=args.bs, shuffle=True,
-                              num_workers=0, pin_memory=pin)
+                              num_workers=args.num_workers, pin_memory=pin)
     val_loader   = DataLoader(val_ds, batch_size=args.bs, shuffle=False,
-                              num_workers=0, pin_memory=pin)
+                              num_workers=args.num_workers, pin_memory=pin)
 
     # Fixed slice subset for monitoring and XAI (drawn once, kept constant)
     val_files = list(val_ds.files if hasattr(val_ds, "files") else
@@ -392,17 +397,31 @@ def main(args):
         optimizer, T_max=args.epochs, eta_min=C.LR_ETA_MIN)
     ema = utils.EMA(unet, decay=C.EMA_DECAY)
 
+    # ── Resume (Colab/preemption safety) ─────────────────────────────
+    start_epoch, best_loss = 1, float("inf")
+    if args.resume:
+        rp = ckptkit.find_resume(C.UNET_CKPT_DIR)
+        if rp is not None:
+            ck = ckptkit.load_checkpoint(rp, model=unet, optimizer=optimizer,
+                                         scheduler=lr_sched, ema=ema, device=device)
+            start_epoch = int(ck["epoch"]) + 1
+            best_loss = ck.get("best_metric") or float("inf")
+            log.info("Resumed from %s → epoch %d (best loss %.6f)",
+                     rp, start_epoch, best_loss)
+        else:
+            log.info("--resume set but no %s/last.pt — starting fresh.", C.UNET_CKPT_DIR)
+
     log.info("=" * 60)
-    log.info("Training: %d epochs | bs %d | lr %.1e | EMA %.4f | clip %.1f",
-             args.epochs, args.bs, args.lr, C.EMA_DECAY, C.GRAD_CLIP_NORM)
+    log.info("Training: %d epochs | bs %d×accum %d | lr %.1e | EMA %.4f | clip %.1f",
+             args.epochs, args.bs, args.grad_accum, args.lr, C.EMA_DECAY,
+             C.GRAD_CLIP_NORM)
     log.info("=" * 60)
 
-    best_loss = float("inf")
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         avg_loss = train_one_epoch(
             unet, vae, scheduler, train_loader, optimizer, ema,
-            device, epoch, args.epochs)
+            device, epoch, args.epochs, grad_accum=args.grad_accum)
         lr_sched.step()
         log.info("Epoch %d/%d  —  avg loss: %.6f  —  lr %.2e  —  %.1fs",
                  epoch, args.epochs, avg_loss, lr_sched.get_last_lr()[0],
@@ -433,6 +452,25 @@ def main(args):
             unet.load_state_dict(raw_state)
             utils.clear_cache()
 
+        # ── Resumable checkpoint every epoch (model + optim + sched + EMA) ──
+        ckptkit.save_checkpoint(C.UNET_CKPT_DIR / "last.pt", model=unet,
+                                optimizer=optimizer, scheduler=lr_sched, ema=ema,
+                                epoch=epoch, best_metric=best_loss)
+        if epoch % args.save_every == 0 or epoch == args.epochs:
+            ckptkit.save_checkpoint(C.UNET_CKPT_DIR / f"ckpt_ep{epoch:03d}.pt",
+                                    model=unet, optimizer=optimizer, scheduler=lr_sched,
+                                    ema=ema, epoch=epoch, best_metric=best_loss)
+            ckptkit.prune_old(C.UNET_CKPT_DIR, keep_last=args.keep_last)
+            # Persist EMA weights periodically — not only at the very end, so a
+            # mid-run disconnect still leaves usable inference weights.
+            raw_state = {k: v.detach().cpu().clone() for k, v in unet.state_dict().items()}
+            ema.copy_to(unet)
+            C.UNET_EMA_DIR.mkdir(parents=True, exist_ok=True)
+            unet.save_pretrained(C.UNET_EMA_DIR)
+            unet.load_state_dict(raw_state)
+            log.info("  ↳ checkpoint + EMA snapshot @ epoch %d → %s",
+                     epoch, C.UNET_CKPT_DIR)
+
     # ── Save EMA weights ─────────────────────────────────────────
     ema.copy_to(unet)
     C.UNET_EMA_DIR.mkdir(parents=True, exist_ok=True)
@@ -461,6 +499,16 @@ if __name__ == "__main__":
     parser.add_argument("--bs",        type=int,   default=8,    help="Batch size (default: 8)")
     parser.add_argument("--lr",        type=float, default=1e-4, help="Initial learning rate (default: 1e-4)")
     parser.add_argument("--cal-every", type=int,   default=5,    help="Calibration + XAI interval in epochs (default: 5)")
+    parser.add_argument("--grad-accum",  type=int, default=1,
+                        help="Gradient accumulation steps → effective batch = bs × this.")
+    parser.add_argument("--num-workers", type=int, default=2,
+                        help="DataLoader workers (T4 Colab ≈ 2 vCPUs; default 2).")
+    parser.add_argument("--save-every",  type=int, default=C.CKPT_EVERY,
+                        help="Epoch-tagged checkpoint + EMA snapshot every N epochs.")
+    parser.add_argument("--keep-last",   type=int, default=C.CKPT_KEEP_LAST,
+                        help="Retain only the most recent N epoch-tagged checkpoints.")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from UNET_CKPT_DIR/last.pt if present (Colab-safe).")
     args = parser.parse_args()
 
     main(args)

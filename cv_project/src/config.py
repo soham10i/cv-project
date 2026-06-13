@@ -150,6 +150,14 @@ EMA_DECAY      = 0.999
 GRAD_CLIP_NORM = 1.0
 LR_ETA_MIN     = 1e-6
 
+# ── Checkpointing (ckptkit) — resumable bundles for Colab/preemption safety ──
+# Point CV_MODEL_DIR at Google Drive so these survive a disconnect, then pass
+# --resume to continue.  Periodic epoch snapshots are pruned to CKPT_KEEP_LAST.
+CKPT_EVERY     = 5
+CKPT_KEEP_LAST = 3
+VAE_CKPT_DIR   = MODEL_DIR / "vae_ft_ckpt"     # train_vae.py resume bundles
+UNET_CKPT_DIR  = MODEL_DIR / "unet_ckpt"       # train_healthy_manifold.py resume bundles
+
 # ─────────────────────────────────────────────
 # Calibration / scoring
 # ─────────────────────────────────────────────

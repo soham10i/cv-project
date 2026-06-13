@@ -100,6 +100,13 @@ tensorboard --logdir logs/
 - Optional deps (`lpips`, `tensorboard`) **degrade gracefully** if absent.
 - Training runs on the user's Mac (MPS); the web/cloud container has no ML stack,
   so changes are validated by `py_compile` + static checks and smoke-tested locally.
+- **Checkpoint/resume (`ckptkit.py`)**: both trainers write `last.pt` every epoch
+  (model+optim+sched+EMA+RNG) plus periodic `ckpt_ep###.pt` (pruned to
+  `CKPT_KEEP_LAST`). Pass `--resume` to continue. CLI knobs: `--grad-accum`,
+  `--num-workers`, `--save-every`, `--keep-last`.
+- **Colab T4 (15 GB)**: VAE bs≈4 (×accum), diffusion bs≈16, fp32. Mount Drive and
+  set `CV_MODEL_DIR` / `CV_PROCESSED_DIR` / `CV_LOG_DIR` there so checkpoints/data
+  survive disconnects; re-running `run_full_cloud.sh` (RESUME=1) continues.
 
 ## Next steps (Stage 2)
 
