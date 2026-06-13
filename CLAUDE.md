@@ -56,6 +56,12 @@ python src/evaluate_pipeline.py                         # metrics (DICE, AUPRC, 
 tensorboard --logdir logs/
 ```
 
+**One-command entry points** (in `cv_project/`):
+- `bash smoke_test.sh` — local macOS/MPS go/no-go: runs Stage 1 + Stage 2 on tiny
+  caps, prints a PASS/FAIL table. Use before committing to cloud GPU.
+- `bash run_full_cloud.sh` — full-scale CUDA run (auto-selects GPU). Env-knob caps/epochs.
+- `bash run_pipeline.sh` — legacy diffusion-only path (no VAE stage).
+
 ## Key files (`cv_project/src/`)
 
 | File | Role |
