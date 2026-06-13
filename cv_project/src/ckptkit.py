@@ -59,7 +59,13 @@ def load_checkpoint(path, *, model, optimizer=None, scheduler=None, ema=None,
                     device=None, map_location="cpu") -> dict:
     """Restore a bundle written by ``save_checkpoint`` in place.  Returns the
     raw dict so the caller can read ``epoch`` / ``best_metric`` / ``extra``."""
-    ck = torch.load(path, map_location=map_location)
+    # weights_only=False: our own bundles contain optimizer/RNG (numpy) state,
+    # which PyTorch 2.6's default weights_only=True unpickler rejects. We wrote
+    # these files, so they are trusted. Fall back for older torch without the kwarg.
+    try:
+        ck = torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        ck = torch.load(path, map_location=map_location)
     model.load_state_dict(ck["model"])
     if optimizer is not None and ck.get("optimizer") is not None:
         optimizer.load_state_dict(ck["optimizer"])
