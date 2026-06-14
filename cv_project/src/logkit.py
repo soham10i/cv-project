@@ -104,7 +104,24 @@ class RunLogger:
     def _build_tensorboard(self):
         try:
             from torch.utils.tensorboard import SummaryWriter  # type: ignore
-            return SummaryWriter(log_dir=str(self.run_dir / "tensorboard"))
+            tb_dir = str(self.run_dir / "tensorboard")
+            writer = SummaryWriter.__new__(SummaryWriter)
+            # Init with a short timeout guard — on some Colab runtimes the
+            # background writer thread hangs on first file creation.
+            import threading
+            result = [None]
+            exc = [None]
+            def _init():
+                try:
+                    result[0] = SummaryWriter(log_dir=tb_dir)
+                except Exception as e:
+                    exc[0] = e
+            t = threading.Thread(target=_init, daemon=True)
+            t.start()
+            t.join(timeout=5.0)  # give TB 5 s to init; skip if it hangs
+            if t.is_alive() or exc[0] is not None:
+                return None
+            return result[0]
         except Exception:
             return None
 
