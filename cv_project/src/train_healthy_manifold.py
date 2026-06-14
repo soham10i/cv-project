@@ -268,10 +268,11 @@ def train_one_epoch(unet, vae, scheduler, loader, optimizer, ema, device,
 
         running_loss += loss.item()
         n_batches += 1
+        avg_so_far = running_loss / n_batches
 
-        if (batch_idx + 1) % max(1, n_total // 4) == 0:
-            log.info("  Epoch %d/%d  |  batch %d/%d  |  loss: %.6f",
-                     epoch, total_epochs, batch_idx + 1, n_total, loss.item())
+        log.info("  Epoch %d/%d  |  batch %d/%d  |  loss: %.6f  |  avg: %.6f",
+                 epoch, total_epochs, batch_idx + 1, n_total,
+                 loss.item(), avg_so_far)
 
     return running_loss / max(n_batches, 1)
 
@@ -465,14 +466,17 @@ def main(args):
         utils.clear_cache()
 
     for epoch in range(start_epoch, args.epochs + 1):
+        log.info("─" * 60)
+        log.info("EPOCH %d / %d  (lr=%.2e)", epoch, args.epochs,
+                 optimizer.param_groups[0]["lr"])
         t0 = time.time()
         avg_loss = train_one_epoch(
             unet, vae, scheduler, train_loader, optimizer, ema,
             device, epoch, args.epochs, grad_accum=args.grad_accum)
         lr_sched.step()
-        log.info("Epoch %d/%d  —  avg loss: %.6f  —  lr %.2e  —  %.1fs",
-                 epoch, args.epochs, avg_loss, lr_sched.get_last_lr()[0],
-                 time.time() - t0)
+        elapsed = time.time() - t0
+        log.info("EPOCH %d/%d  DONE  |  avg_loss: %.6f  |  lr: %.2e  |  time: %.1fs",
+                 epoch, args.epochs, avg_loss, lr_sched.get_last_lr()[0], elapsed)
 
         # ── Validation denoising loss + unified metric logging ──────────
         val_loss = validate_denoising(unet, vae, scheduler, val_loader, device,
