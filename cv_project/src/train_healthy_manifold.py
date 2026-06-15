@@ -439,7 +439,10 @@ def main(args):
     ema = utils.EMA(unet, decay=C.EMA_DECAY)
 
     # ── Resume (Colab/preemption safety) ─────────────────────────────
+    # best_loss now tracks the best *validation* denoising loss (lower = better
+    # generalization). epochs_no_improve drives early stopping.
     start_epoch, best_loss = 1, float("inf")
+    epochs_no_improve = 0
     if args.resume:
         rp = ckptkit.find_resume(C.UNET_CKPT_DIR)
         if rp is not None:
@@ -486,12 +489,37 @@ def main(args):
                                         "lr": lr_sched.get_last_lr()[0]})
         rl.log_metrics(epoch, "val", {"denoise_loss": val_loss})
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        # ── Best-model selection on VALIDATION loss (generalization, not memorization).
+        # Saving on train loss kept overwriting with increasingly overfit weights; the
+        # val denoising loss is the honest signal of how well the healthy manifold
+        # generalizes.  Both the raw UNet and the EMA weights are snapshotted at each
+        # new val-best so evaluation always loads the best-generalizing model.
+        if val_loss < best_loss:
+            best_loss = val_loss
+            epochs_no_improve = 0
             C.UNET_DIR.mkdir(parents=True, exist_ok=True)
             unet.save_pretrained(C.UNET_DIR)
-            log.info("  ↳ new best (loss %.6f) — raw UNet saved → %s",
-                     best_loss, C.UNET_DIR)
+            # also snapshot EMA at the val-best
+            raw_state = {k: v.detach().cpu().clone() for k, v in unet.state_dict().items()}
+            ema.copy_to(unet)
+            C.UNET_EMA_DIR.mkdir(parents=True, exist_ok=True)
+            unet.save_pretrained(C.UNET_EMA_DIR)
+            unet.load_state_dict(raw_state)
+            log.info("  ↳ new best VAL loss %.6f — raw+EMA UNet saved (best-generalizing)",
+                     best_loss)
+        else:
+            epochs_no_improve += 1
+            log.info("  (no val improvement for %d epoch(s); best %.6f)",
+                     epochs_no_improve, best_loss)
+
+        # ── Early stopping — halt once val loss stops improving (overfitting onset).
+        if args.patience > 0 and epochs_no_improve >= args.patience:
+            log.info("=" * 60)
+            log.info("EARLY STOP at epoch %d — no val improvement for %d epochs "
+                     "(best val loss %.6f). Best-generalizing model already saved.",
+                     epoch, args.patience, best_loss)
+            log.info("=" * 60)
+            break
 
         # ── Periodic calibration + monitoring + XAI ──────────────
         if epoch % args.cal_every == 0 or epoch == args.epochs:
@@ -524,24 +552,30 @@ def main(args):
                                     model=unet, optimizer=optimizer, scheduler=lr_sched,
                                     ema=ema, epoch=epoch, best_metric=best_loss)
             ckptkit.prune_old(C.UNET_CKPT_DIR, keep_last=args.keep_last)
-            # Persist EMA weights periodically — not only at the very end, so a
-            # mid-run disconnect still leaves usable inference weights.
+            # Persist the *current* EMA periodically to a sibling dir (disconnect
+            # safety) — never to UNET_EMA_DIR, which is reserved for the best-val
+            # EMA so evaluation always loads the best-generalizing weights.
             raw_state = {k: v.detach().cpu().clone() for k, v in unet.state_dict().items()}
             ema.copy_to(unet)
-            C.UNET_EMA_DIR.mkdir(parents=True, exist_ok=True)
-            unet.save_pretrained(C.UNET_EMA_DIR)
+            periodic_ema = C.UNET_EMA_DIR.parent / "unet_ema_periodic"
+            periodic_ema.mkdir(parents=True, exist_ok=True)
+            unet.save_pretrained(periodic_ema)
             unet.load_state_dict(raw_state)
-            log.info("  ↳ checkpoint + EMA snapshot @ epoch %d → %s",
+            log.info("  ↳ checkpoint + periodic EMA snapshot @ epoch %d → %s",
                      epoch, C.UNET_CKPT_DIR)
 
-    # ── Save EMA weights ─────────────────────────────────────────
+    # ── Final EMA weights → separate dir (do NOT clobber the best-val EMA) ──
+    # UNET_EMA_DIR holds the best-generalizing EMA (saved at each val-best above);
+    # the final/overfit EMA goes to a sibling dir for optional comparison only.
     ema.copy_to(unet)
-    C.UNET_EMA_DIR.mkdir(parents=True, exist_ok=True)
-    unet.save_pretrained(C.UNET_EMA_DIR)
-    log.info("EMA UNet weights saved → %s", C.UNET_EMA_DIR)
+    final_ema_dir = C.UNET_EMA_DIR.parent / "unet_ema_final"
+    final_ema_dir.mkdir(parents=True, exist_ok=True)
+    unet.save_pretrained(final_ema_dir)
+    log.info("Final EMA weights saved → %s (best-val EMA kept at %s)",
+             final_ema_dir, C.UNET_EMA_DIR)
 
     log.info("=" * 60)
-    log.info("DONE  —  best training loss: %.6f", best_loss)
+    log.info("DONE  —  best VALIDATION loss: %.6f", best_loss)
     log.info("  Raw UNet : %s", C.UNET_DIR)
     log.info("  EMA UNet : %s   (preferred for evaluation)", C.UNET_EMA_DIR)
     log.info("  Baseline : %s", C.BASELINE_PATH)
@@ -576,6 +610,9 @@ if __name__ == "__main__":
                         help="Resume from UNET_CKPT_DIR/last.pt if present (Colab-safe).")
     parser.add_argument("--val-batches", type=int, default=25,
                         help="Batches used for the validation denoising loss (default: 25).")
+    parser.add_argument("--patience", type=int, default=0,
+                        help="Early-stop after N epochs with no val-loss improvement "
+                             "(0 = disabled). Best-generalizing model is always saved.")
     parser.add_argument("--no-xai", action="store_true",
                         help="Skip SAAM/residual XAI panels (incl. the epoch-0 snapshot).")
     parser.add_argument("--no-tensorboard", action="store_true")
