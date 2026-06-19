@@ -1,0 +1,16 @@
+# Core deep learning
+torch>=2.1.0
+diffusers>=0.27.0
+
+# Numerics / imaging
+numpy>=1.24.0
+scipy>=1.10.0
+nibabel>=5.1.0          # NIfTI I/O (preprocessing only)
+scikit-learn>=1.3.0     # AUROC / AUPRC
+matplotlib>=3.7.0       # figures / panels
+
+# Optional — boundary refinement (CRF). Pipeline runs without it.
+# pydensecrf>=1.0rc3
+
+# Dev / testing
+pytest>=7.4.0

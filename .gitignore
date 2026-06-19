@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+
+# Processed data outputs
+data/processed/
+BraTS-PEDs-v1/
+01_cv-project/data/
+01_cv-project/models/
+01_cv-project/model/
+01_cv-project/results/
+
+models/
+
+brats-uad/data/
+brats-uad/local_logs/
+brats-uad/results/
+brats-uad/local_models/
+
+
+
+# extensions 
+*.safetensors
+.env
+.pt
