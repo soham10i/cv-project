@@ -73,6 +73,37 @@ def save_explanation_panel(
     return top_mod
 
 
+def save_gradcam_panel(
+    name: str,
+    result: ScoreResult,
+    gradcam: np.ndarray,
+    gt: np.ndarray,
+    out_dir: Path,
+) -> None:
+    """Grad-CAM 'model-focus' figure: where the network looked vs. what it scored.
+
+    Columns: original T1c, fused anomaly score, Grad-CAM model-focus map, the
+    Grad-CAM overlaid on the anatomy, and the ground-truth lesion mask.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(1, 5, figsize=(22, 4.5))
+    t1c = result.orig[1]
+    ax[0].imshow(t1c, cmap="gray"); ax[0].set_title("Original (T1c)")
+    im1 = ax[1].imshow(result.score, cmap="hot"); ax[1].set_title("Anomaly score (fused)")
+    plt.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
+    im2 = ax[2].imshow(gradcam, cmap="jet"); ax[2].set_title("Grad-CAM (model focus)")
+    plt.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
+    ax[3].imshow(t1c, cmap="gray")
+    ax[3].imshow(gradcam, cmap="jet", alpha=0.45); ax[3].set_title("Grad-CAM overlay")
+    ax[4].imshow(gt, cmap="gray"); ax[4].set_title("Ground truth")
+    for a in ax:
+        a.axis("off")
+    fig.suptitle(f"{name} | Grad-CAM model-focus at inference", fontweight="bold")
+    plt.tight_layout()
+    fig.savefig(out_dir / f"gradcam_{name}.png", dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_trajectory_strip(name: str, cf: CounterfactualResult, out_dir: Path) -> None:
     """Healing-trajectory strip: DDIM frames in-painting the anomaly."""
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -116,9 +116,15 @@ Outputs:
 
 ## 5. Recommended full-run on a GPU
 
-See [`docs/RUNPOD.md`](docs/RUNPOD.md) for a step-by-step RunPod walkthrough
-(pod selection, volume setup, env vars, training, and pulling results back).
-Budget: a single A100 run of the whole pipeline is **~3.5 GPU-hours ≈ €6**.
+Two walkthroughs:
+- [`docs/RUNPOD.md`](docs/RUNPOD.md) — RunPod (network volume, RTX 4090/A100).
+- [`docs/COLAB.md`](docs/COLAB.md) — Google Colab with compute credits: preprocess
+  locally → two zips → Drive → `/content`, with **resume-safe** training
+  (`scripts/01_train.py --resume`) and a ready notebook
+  [`notebooks/run_pdm_colab.ipynb`](notebooks/run_pdm_colab.ipynb).
+
+Budget: a single A100 run of the whole pipeline is **~3.5 GPU-hours ≈ €6** (or
+~50 Colab credits on A100; ~3× cheaper on L4).
 
 | Stage | A100-40GB time |
 |------|----------------|

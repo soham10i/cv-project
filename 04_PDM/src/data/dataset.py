@@ -25,7 +25,7 @@ from torch.utils.data import Dataset
 from ..config import CONFIG
 from ..utils.exceptions import DataError
 from ..utils.io import read_manifest
-from .patches import extract_patches, patch_foreground_fraction
+from .patches import iter_patch_coords, patch_foreground_fraction
 
 
 class HealthyPatchDataset(Dataset):
@@ -51,14 +51,16 @@ class HealthyPatchDataset(Dataset):
         if limit:
             stems = stems[:limit]
 
+        # Build the flat patch index using memory-mapped reads so we only touch
+        # each patch region, never the whole slice. Slices are stored float16.
         self.index: list[tuple[str, int, int]] = []
         for stem in stems:
             f = self.slices_dir / f"{stem}.npy"
             if not f.exists():
                 continue
-            img = np.load(f).astype(np.float32)
-            _, coords = extract_patches(img, self.patch_size, self.stride)
-            for (t, l) in coords:
+            img = np.load(f, mmap_mode="r")
+            size = img.shape[-1]
+            for (t, l) in iter_patch_coords(size, self.patch_size, self.stride):
                 patch = img[:, t : t + self.patch_size, l : l + self.patch_size]
                 if patch_foreground_fraction(patch) >= CONFIG.patch.min_patch_foreground:
                     self.index.append((stem, t, l))
@@ -68,7 +70,8 @@ class HealthyPatchDataset(Dataset):
                 f"No foreground patches found from manifest {manifest_path}. "
                 "Check preprocessing output and patch thresholds."
             )
-        # Light per-slice cache to avoid re-reading the same .npy repeatedly.
+        # Cache the open memmap handle for the most-recent slice. Even on a cache
+        # miss (expected with shuffle) the crop below pages in only the patch.
         self._cache_stem: str | None = None
         self._cache_img: np.ndarray | None = None
 
@@ -77,14 +80,17 @@ class HealthyPatchDataset(Dataset):
 
     def _load(self, stem: str) -> np.ndarray:
         if stem != self._cache_stem:
-            self._cache_img = np.load(self.slices_dir / f"{stem}.npy").astype(np.float32)
+            self._cache_img = np.load(self.slices_dir / f"{stem}.npy", mmap_mode="r")
             self._cache_stem = stem
         return self._cache_img  # type: ignore[return-value]
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         stem, t, l = self.index[idx]
         img = self._load(stem)
-        patch = img[:, t : t + self.patch_size, l : l + self.patch_size].copy()
+        # Materialise ONLY the patch region as float32 (img is a float16 memmap).
+        patch = np.asarray(
+            img[:, t : t + self.patch_size, l : l + self.patch_size], dtype=np.float32
+        )
 
         if self.augment:
             if np.random.rand() < 0.5:

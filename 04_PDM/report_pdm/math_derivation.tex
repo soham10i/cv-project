@@ -1,0 +1,559 @@
+\documentclass[12pt,a4paper]{article}
+
+% ============================================================================
+%  Complete mathematical derivation for the PDM (Patch-Diffusion) UAD pipeline
+%  Self-contained; can also be \input{} into the main PDM report (delete the
+%  preamble + \begin/\end{document} when including).
+% ============================================================================
+
+\usepackage[utf8]{inputenc}
+\usepackage[a4paper,left=22mm,right=22mm,top=22mm,bottom=24mm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=green!50!black,urlcolor=red!50!black}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{times}
+
+\newtheorem{proposition}{Proposition}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\KL}{\mathrm{D_{KL}}}
+\newcommand{\x}{\bm{x}}
+\newcommand{\z}{\bm{z}}
+\newcommand{\eps}{\bm{\epsilon}}
+\newcommand{\II}{\mathbf{I}}
+\newcommand{\abar}{\bar{\alpha}}
+\newcommand{\given}{\,\vert\,}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\ReLU}{ReLU}
+\DeclareMathOperator{\Var}{Var}
+
+\title{\textbf{Mathematical Foundations of a Patch-Diffusion Model for\\
+Unsupervised Anomaly Detection in Pediatric Brain MRI}\\[4pt]
+\large A complete derivation: from the DDPM variational bound to multi-scale
+counterfactual scoring}
+\author{Soham Patel \\ \small Deep Vision (Summer 2025) --- OTH Amberg-Weiden}
+\date{\today}
+
+\titleformat{\section}{\normalfont\large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\normalfont\normalsize\bfseries}{\thesubsection}{1em}{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\bigskip
+
+\begin{abstract}
+\noindent This document develops, from first principles, the complete
+mathematics of the patch-diffusion model (PDM) used for unsupervised anomaly
+detection (UAD) in this project. Part~\ref{part:ddpm} derives the denoising
+diffusion probabilistic model (DDPM): the forward Gaussian corruption and its
+closed-form marginal, the variational lower bound, the tractable forward
+posterior, the reduction of the bound to a noise-prediction regression, and the
+cosine noise schedule. Part~\ref{part:ddim} derives the deterministic DDIM
+sampler used at inference. Part~\ref{part:pdm} specialises the theory to our
+system: correlated (simplex) noise, patch-wise diffusion with Gaussian fusion,
+the partial-noise reconstruction principle that makes anomalies ``heal,'' the
+multi-scale modality-weighted anomaly score, the healthy-set calibration, and
+the evaluation metrics. Part~\ref{part:xai} gives the mathematics of the
+explainability layer (counterfactual maps, Grad-CAM for a denoiser, additive
+modality/scale attribution). Part~\ref{part:numbers} explains how to read every
+number the pipeline produces during training and inference.
+\end{abstract}
+
+\section*{Notation}
+\addcontentsline{toc}{section}{Notation}
+A clean MRI patch (or slice) is $\x_0\in\R^{C\times P\times P}$ with $C=4$ co-registered
+modalities $(t1n,t1c,t2w,t2f)$, $P=96$ (patch) or $256$ (slice). The diffusion
+index is $t\in\{0,\dots,T\}$, $T=1000$. $\eps$ denotes injected noise, $\eps_\theta$
+the network's prediction. $\N(\bm\mu,\bm\Sigma)$ is a Gaussian; $\II$ the identity.
+Per-step retention $\alpha_t=1-\beta_t$ and cumulative retention
+$\abar_t=\prod_{s=1}^{t}\alpha_s$.
+
+% ===========================================================================
+\part*{Part I\quad The DDPM}
+\addcontentsline{toc}{section}{Part I — The DDPM}
+\label{part:ddpm}
+% ===========================================================================
+
+\section{Generative model and the forward process}
+A diffusion model is a latent-variable model
+$p_\theta(\x_0)=\int p_\theta(\x_{0:T})\,d\x_{1:T}$ whose latents $\x_{1:T}$ are
+produced by a \emph{fixed} Markov chain that gradually destroys structure
+(Sohl-Dickstein et al., 2015; Ho et al., 2020). Each forward step adds a small
+amount of Gaussian noise,
+\begin{equation}
+q(\x_t\given \x_{t-1}) = \N\!\big(\x_t;\, \sqrt{1-\beta_t}\,\x_{t-1},\; \beta_t \II\big),
+\qquad
+q(\x_{1:T}\given\x_0)=\prod_{t=1}^{T} q(\x_t\given\x_{t-1}),
+\label{eq:fwd-step}
+\end{equation}
+with a variance schedule $0<\beta_1<\dots<\beta_T<1$. The scaling $\sqrt{1-\beta_t}$
+(rather than $1$) keeps the process variance-preserving, so that $\x_T$ converges
+to $\N(\bm 0,\II)$ regardless of $\x_0$.
+
+\subsection{Closed-form marginal \texorpdfstring{$q(\x_t\given\x_0)$}{q(x\_t | x\_0)}}
+The single most useful property of \eqref{eq:fwd-step} is that we can sample
+$\x_t$ at \emph{any} $t$ directly, without simulating the chain.
+
+\begin{proposition}[Diffusion kernel]
+With $\alpha_t=1-\beta_t$ and $\abar_t=\prod_{s=1}^t \alpha_s$,
+\begin{equation}
+q(\x_t\given\x_0)=\N\!\big(\x_t;\,\sqrt{\abar_t}\,\x_0,\;(1-\abar_t)\II\big)
+\;\Longleftrightarrow\;
+\x_t=\sqrt{\abar_t}\,\x_0+\sqrt{1-\abar_t}\,\eps,\quad \eps\sim\N(\bm0,\II).
+\label{eq:kernel}
+\end{equation}
+\end{proposition}
+\begin{proof}
+Write one step as $\x_t=\sqrt{\alpha_t}\,\x_{t-1}+\sqrt{1-\alpha_t}\,\eps_{t-1}$ with
+$\eps_{t-1}\sim\N(\bm0,\II)$ i.i.d. Unrolling once,
+\[
+\x_t=\sqrt{\alpha_t\alpha_{t-1}}\,\x_{t-2}
++\underbrace{\sqrt{\alpha_t(1-\alpha_{t-1})}\,\eps_{t-2}+\sqrt{1-\alpha_t}\,\eps_{t-1}}_{=: \,\bm u}.
+\]
+$\bm u$ is a sum of independent zero-mean Gaussians, hence Gaussian with variance
+$\alpha_t(1-\alpha_{t-1})+(1-\alpha_t)=1-\alpha_t\alpha_{t-1}$. Thus
+$\x_t=\sqrt{\alpha_t\alpha_{t-1}}\,\x_{t-2}+\sqrt{1-\alpha_t\alpha_{t-1}}\,\bar\eps$.
+Iterating down to $\x_0$ replaces the product by $\abar_t$ and the variance by
+$1-\abar_t$, giving \eqref{eq:kernel}.
+\end{proof}
+
+\noindent Equation~\eqref{eq:kernel} is what makes training cheap: for a random
+$t$ we obtain a training pair $(\x_t,\eps)$ in one shot. The
+\emph{signal-to-noise ratio} of the corrupted sample is
+$\mathrm{SNR}(t)=\abar_t/(1-\abar_t)$, monotonically decreasing in $t$; it
+governs which structures survive to step $t$ and is central to the UAD argument
+in \S\ref{sec:partial}.
+
+\section{The reverse process and the variational bound}
+Since $q(\x_{t-1}\given\x_t)$ is intractable, we learn a Gaussian reverse chain
+\begin{equation}
+p_\theta(\x_{t-1}\given\x_t)=\N\!\big(\x_{t-1};\,\bm\mu_\theta(\x_t,t),\,\sigma_t^2\II\big),
+\qquad p(\x_T)=\N(\bm0,\II).
+\label{eq:rev}
+\end{equation}
+We fit $\theta$ by maximising a variational lower bound on $\log p_\theta(\x_0)$.
+
+\begin{proposition}[Variational bound]
+\begin{equation}
+\E_q\!\big[-\log p_\theta(\x_0)\big]\le
+\E_q\Big[\underbrace{\KL\!\big(q(\x_T\given\x_0)\,\|\,p(\x_T)\big)}_{L_T}
++\!\sum_{t=2}^{T}\underbrace{\KL\!\big(q(\x_{t-1}\given\x_t,\x_0)\,\|\,p_\theta(\x_{t-1}\given\x_t)\big)}_{L_{t-1}}
+\underbrace{-\log p_\theta(\x_0\given\x_1)}_{L_0}\Big].
+\label{eq:elbo}
+\end{equation}
+\end{proposition}
+\begin{proof}[Sketch]
+Start from $-\log p_\theta(\x_0)\le -\log p_\theta(\x_0)+\KL\big(q(\x_{1:T}\given\x_0)\|p_\theta(\x_{1:T}\given\x_0)\big)
+=\E_q[-\log \frac{p_\theta(\x_{0:T})}{q(\x_{1:T}\given\x_0)}]$.
+Expand both products over $t$, rewrite the forward chain with Bayes' rule as
+$q(\x_t\given\x_{t-1})=q(\x_{t-1}\given\x_t,\x_0)\,q(\x_t\given\x_0)/q(\x_{t-1}\given\x_0)$,
+and telescope the $q(\x_t\given\x_0)$ ratios. Grouping terms yields
+\eqref{eq:elbo}. $L_T$ has no parameters; the work is in the $L_{t-1}$ terms.
+\end{proof}
+
+\subsection{The tractable forward posterior \texorpdfstring{$q(\x_{t-1}\given\x_t,\x_0)$}{q(x\_\{t-1\} | x\_t, x\_0)}}
+Each $L_{t-1}$ compares the learned reverse step to the \emph{true} posterior
+\emph{conditioned on $\x_0$}, which \emph{is} tractable.
+
+\begin{proposition}
+\begin{equation}
+q(\x_{t-1}\given\x_t,\x_0)=\N\!\big(\x_{t-1};\,\tilde{\bm\mu}_t(\x_t,\x_0),\,\tilde\beta_t\II\big),
+\end{equation}
+\begin{equation}
+\tilde\beta_t=\frac{1-\abar_{t-1}}{1-\abar_t}\,\beta_t,
+\qquad
+\tilde{\bm\mu}_t(\x_t,\x_0)=\frac{\sqrt{\abar_{t-1}}\,\beta_t}{1-\abar_t}\,\x_0
++\frac{\sqrt{\alpha_t}\,(1-\abar_{t-1})}{1-\abar_t}\,\x_t.
+\label{eq:posterior}
+\end{equation}
+\end{proposition}
+\begin{proof}
+By Bayes,
+$q(\x_{t-1}\given\x_t,\x_0)\propto q(\x_t\given\x_{t-1})\,q(\x_{t-1}\given\x_0)$,
+a product of two Gaussians (in $\x_{t-1}$) from \eqref{eq:fwd-step} and
+\eqref{eq:kernel}. Collecting the exponent,
+\[
+-\tfrac12\!\left[\frac{\|\x_t-\sqrt{\alpha_t}\x_{t-1}\|^2}{\beta_t}
++\frac{\|\x_{t-1}-\sqrt{\abar_{t-1}}\x_0\|^2}{1-\abar_{t-1}}\right]
+=-\tfrac12\!\left[\Big(\tfrac{\alpha_t}{\beta_t}+\tfrac{1}{1-\abar_{t-1}}\Big)\|\x_{t-1}\|^2
+-2\,\x_{t-1}^\top\bm b+\text{const}\right],
+\]
+with $\bm b=\frac{\sqrt{\alpha_t}}{\beta_t}\x_t+\frac{\sqrt{\abar_{t-1}}}{1-\abar_{t-1}}\x_0$.
+Completing the square identifies a Gaussian with precision
+$\tilde\beta_t^{-1}=\frac{\alpha_t}{\beta_t}+\frac{1}{1-\abar_{t-1}}=\frac{1-\abar_t}{\beta_t(1-\abar_{t-1})}$
+(using $\alpha_t(1-\abar_{t-1})+\beta_t=1-\abar_t$) and mean
+$\tilde{\bm\mu}_t=\tilde\beta_t\,\bm b$, which simplifies to \eqref{eq:posterior}.
+\end{proof}
+
+\subsection{Gaussian KL and the mean-matching objective}
+For two Gaussians with equal covariance $\sigma_t^2\II$, the KL collapses to a
+scaled squared distance of the means:
+\begin{equation}
+L_{t-1}=\E_q\!\left[\frac{1}{2\sigma_t^2}\big\|\tilde{\bm\mu}_t(\x_t,\x_0)-\bm\mu_\theta(\x_t,t)\big\|^2\right]+\text{const}.
+\label{eq:meanmatch}
+\end{equation}
+So the network only needs to predict the posterior mean.
+
+\subsection{Reparameterisation to noise prediction}
+Ho et al.\ (2020) observed that predicting $\eps$ instead of $\bm\mu$ is both
+simpler and empirically better. Invert \eqref{eq:kernel},
+$\x_0=(\x_t-\sqrt{1-\abar_t}\,\eps)/\sqrt{\abar_t}$, and substitute into
+\eqref{eq:posterior}:
+\begin{equation}
+\tilde{\bm\mu}_t=\frac{1}{\sqrt{\alpha_t}}\Big(\x_t-\frac{\beta_t}{\sqrt{1-\abar_t}}\,\eps\Big).
+\label{eq:mu-eps}
+\end{equation}
+Choosing the \emph{same} functional form for the model,
+$\bm\mu_\theta=\frac{1}{\sqrt{\alpha_t}}\big(\x_t-\frac{\beta_t}{\sqrt{1-\abar_t}}\,\eps_\theta(\x_t,t)\big)$,
+makes the difference of means proportional to the difference of noises. Plugging
+into \eqref{eq:meanmatch},
+\begin{equation}
+L_{t-1}=\E_{\x_0,\eps}\!\left[\frac{\beta_t^2}{2\sigma_t^2\,\alpha_t(1-\abar_t)}
+\big\|\eps-\eps_\theta(\sqrt{\abar_t}\x_0+\sqrt{1-\abar_t}\eps,\,t)\big\|^2\right].
+\label{eq:Lt-eps}
+\end{equation}
+
+\subsection{The simplified training objective}
+Dropping the per-$t$ weight in \eqref{eq:Lt-eps} (which Ho et al.\ found improves
+sample quality by up-weighting harder, higher-noise steps) yields the objective
+this project optimises:
+\begin{equation}
+\boxed{\;
+\mathcal{L}_{\text{simple}}(\theta)=
+\E_{\x_0\sim p_{\text{healthy}},\;t\sim\mathcal U\{1,\dots,T\},\;\eps\sim\N(\bm0,\II)}
+\Big[\big\|\eps-\eps_\theta(\sqrt{\abar_t}\,\x_0+\sqrt{1-\abar_t}\,\eps,\;t)\big\|_2^2\Big].
+\;}
+\label{eq:simple}
+\end{equation}
+The expectation over $\x_0$ is taken \emph{only over healthy patches}: the network
+learns the score of the healthy data distribution. This is the exact loss in
+\texttt{DiffusionProcess.training\_loss} (\texttt{src/models/diffusion.py}).
+
+\subsection{The cosine noise schedule}
+Rather than a linear $\beta_t$, we use the cosine schedule of Nichol \& Dhariwal
+(2021), which avoids destroying information too quickly at the end of the chain:
+\begin{equation}
+\abar_t=\frac{f(t)}{f(0)},\qquad f(t)=\cos^2\!\Big(\frac{t/T+s}{1+s}\cdot\frac{\pi}{2}\Big),
+\qquad \beta_t=1-\frac{\abar_t}{\abar_{t-1}},
+\label{eq:cosine}
+\end{equation}
+with a small offset $s$ (the \texttt{squaredcos\_cap\_v2} schedule,
+$\beta\in[10^{-4},2\!\times\!10^{-2}]$). It allocates more steps to the
+high-SNR regime, where the fine anatomical detail that UAD depends on lives.
+
+% ===========================================================================
+\part*{Part II\quad Deterministic sampling with DDIM}
+\addcontentsline{toc}{section}{Part II — DDIM}
+\label{part:ddim}
+% ===========================================================================
+
+\section{Non-Markovian inference and the DDIM update}
+Training fixes the marginals \eqref{eq:kernel} but \emph{not} the joint; Song et
+al.\ (2021) exploit this freedom with a family of non-Markovian forward
+processes sharing the same $q(\x_t\given\x_0)$, indexed by a stochasticity vector
+$\sigma_t\ge0$:
+\begin{equation}
+q_\sigma(\x_{t-1}\given\x_t,\x_0)=\N\!\Big(\sqrt{\abar_{t-1}}\,\x_0
++\sqrt{1-\abar_{t-1}-\sigma_t^2}\cdot\frac{\x_t-\sqrt{\abar_t}\,\x_0}{\sqrt{1-\abar_t}},\;\sigma_t^2\II\Big).
+\end{equation}
+Because the $\eps$-objective \eqref{eq:simple} is unchanged, we reuse the trained
+$\eps_\theta$. Substituting the predicted clean sample
+\begin{equation}
+\hat{\x}_0(\x_t,t)=\frac{\x_t-\sqrt{1-\abar_t}\,\eps_\theta(\x_t,t)}{\sqrt{\abar_t}}
+\label{eq:x0hat}
+\end{equation}
+gives the generative update
+\begin{equation}
+\x_{t-1}=\sqrt{\abar_{t-1}}\,\hat{\x}_0(\x_t,t)
++\sqrt{1-\abar_{t-1}-\sigma_t^2}\;\eps_\theta(\x_t,t)+\sigma_t\,\z,\quad \z\sim\N(\bm0,\II).
+\label{eq:ddim}
+\end{equation}
+Setting $\sigma_t=0$ for all $t$ makes the map \textbf{deterministic} (DDIM): the
+only randomness in a reconstruction is the single noise vector injected at the
+start. We use $\sigma_t=0$ so that pseudo-healthy reconstructions are
+reproducible, and we evaluate \eqref{eq:ddim} on a short sub-sequence of
+timesteps ($\le 50$ DDIM steps inside $[0,T_{\text{int}}]$), which is exact for the
+marginals and $\sim\!20\times$ faster than the full chain.
+
+% ===========================================================================
+\part*{Part III\quad The PDM anomaly-detection pipeline}
+\addcontentsline{toc}{section}{Part III — PDM pipeline}
+\label{part:pdm}
+% ===========================================================================
+
+\section{Correlated (simplex) noise}
+White Gaussian noise has a flat power spectrum, so the forward process erases
+\emph{fine, pixel-scale} detail first; large coherent structures (and large
+lesions) survive to high $t$. Following AnoDDPM (Wyatt et al., 2022) we instead
+corrupt with \textbf{spatially correlated} noise approximating simplex noise,
+built as a sum of fractal octaves
+\begin{equation}
+\bm n(\bm r)=\frac{1}{Z}\sum_{o=0}^{O-1} \rho^{\,o}\,g_{f_0\lambda^{o}}(\bm r),
+\qquad O=6,\;\rho=0.8,\;\lambda=2,\;f_0=16,
+\label{eq:simplex}
+\end{equation}
+where $g_{f}$ is a band of spatial frequency $f$, $\rho$ is the per-octave
+\emph{persistence} (amplitude decay), $\lambda$ the \emph{lacunarity} (frequency
+growth), and $Z$ normalises to unit variance. The resulting power spectrum is
+concentrated at \emph{low} frequencies ($\sim 1/f$), so the corruption attacks
+mid-/large-scale structure. The model is trained with this same noise
+(\texttt{src/noise/simplex.py}); the objective \eqref{eq:simple} is unchanged in
+form (predict the injected $\bm n$), while the schedule coefficients
+$\sqrt{\abar_t},\sqrt{1-\abar_t}$ remain the mixing weights. This biases the
+detector toward the blob-like spatial scale of tumours.
+
+\section{Patch diffusion and Gaussian fusion}
+\subsection{Why patches}
+The model operates on overlapping $P\times P=96\times96$ patches (stride $16$)
+rather than whole slices. With $\sim$196 patches per slice, a few thousand
+healthy slices become $\sim$570k training samples --- a $\sim$196$\times$ data
+amplification that is decisive in the low-patient pediatric regime --- and the
+network is forced to learn a \emph{local} texture model of healthy tissue, which
+generalises better than a global one and cannot ``memorise'' whole-slice layout.
+Each patch is an independent draw of \eqref{eq:simple}.
+
+\subsection{Fusion as confidence-weighted averaging}
+A pixel $\bm u$ is covered by many patches; patch $p$ assigns it a score
+$s_p(\bm u)$ that is more reliable near the patch centre (full context) than at
+its edge. We therefore fuse with a centred Gaussian window
+$w(\bm u)=\exp(-\|\bm u-\bm c_p\|^2/2\sigma_f^2)$, $\sigma_f=32$:
+\begin{equation}
+S(\bm u)=\frac{\sum_{p}w_p(\bm u)\,s_p(\bm u)}{\sum_{p}w_p(\bm u)}.
+\label{eq:fusion}
+\end{equation}
+This is the maximum-likelihood combination of per-patch estimates under the
+assumption that edge pixels carry higher variance (inverse-variance weighting),
+and it removes the blocky seams a hard tiling would produce
+(\texttt{GaussianPatchFuser}, \texttt{src/data/patches.py}).
+
+\section{Partial-noise reconstruction: why anomalies ``heal''}
+\label{sec:partial}
+At inference we do \emph{not} start from pure noise. A test patch is encoded,
+noised \emph{partially} to an intermediate level $T_{\text{int}}$ via
+\eqref{eq:kernel}, then denoised deterministically with \eqref{eq:ddim} back to
+$t=0$:
+\begin{equation}
+\x_{T_{\text{int}}}=\sqrt{\abar_{T_{\text{int}}}}\,\x_0+\sqrt{1-\abar_{T_{\text{int}}}}\,\bm n
+\;\xrightarrow[\text{DDIM},\,\sigma=0]{\;\eps_\theta\;}\;\hat{\x}_0^{\,\text{healthy}}.
+\end{equation}
+\textbf{Heuristic projection argument.} Let $\mathcal M_h$ be the manifold of
+healthy patches (the support of $p_{\text{healthy}}$ the model learned). Decompose
+an anomalous patch as $\x_0=\x_h+\bm a$, $\x_h\in\mathcal M_h$, $\bm a$ the lesion
+perturbation. Forward noising adds isotropic-in-law corruption of magnitude
+$\sqrt{1-\abar_{T_{\text{int}}}}$; if the lesion's energy lies within the band the
+corruption destroys, then $\x_{T_{\text{int}}}$ is, with high probability, closer to
+the noised \emph{healthy} sample than to any noised anomalous one. The reverse
+chain --- trained only on $\mathcal M_h$ --- then denoises toward $\mathcal M_h$,
+returning $\hat{\x}_0^{\text{healthy}}\approx\x_h$ and \emph{erasing} $\bm a$.
+Healthy tissue ($\bm a=\bm 0$) is reconstructed faithfully. The residual
+\begin{equation}
+\bm r=\big|\x_0-\hat{\x}_0^{\text{healthy}}\big|\approx|\bm a|
+\end{equation}
+therefore localises the anomaly. The choice of $T_{\text{int}}$ is the central
+trade-off: too small fails to erase large lesions (the band is too narrow), too
+large discards patient-specific healthy anatomy (degrading the residual
+baseline). This motivates multi-scale scoring.
+
+\section{Multi-scale, modality-weighted anomaly score}
+\subsection{Per-modality residual and the CE channel}
+Modalities differ in clinical salience, so the scalar residual is a weighted sum
+over channels, augmented with an explicit contrast-enhancement channel
+$\mathrm{CE}=t1c-t1n$ (a marker of active tumour invisible to pipelines that drop
+native T1):
+\begin{equation}
+r(\bm u)=\sum_{k\in\mathcal K}\bar w_k\,\big|\x_0^{(k)}(\bm u)-\hat{\x}_0^{(k)}(\bm u)\big|,
+\quad
+r_{\mathrm{CE}}=\big|(\x_0^{t1c}-\x_0^{t1n})-(\hat{\x}_0^{t1c}-\hat{\x}_0^{t1n})\big|,
+\label{eq:residual}
+\end{equation}
+with weights $\bm w\propto(0.5,1.0,0.75,1.5)$ for $(t1n,t1c,t2w,t2f)$ and
+$w_{\mathrm{CE}}=1.0$, normalised so $\sum_k\bar w_k=1$
+(\texttt{weighted\_residual}, \texttt{src/scoring/residual.py}). FLAIR ($t2f$) and
+contrast dominate, mirroring radiological reasoning.
+
+\subsection{Scale fusion}
+We reconstruct at several noise levels $T\in\mathcal T=\{50,150,250\}$ ---
+low $T$ for fine/texture lesions (high SNR retains detail), high $T$ for large
+structural lesions --- producing a fused per-scale map $S_T$ via
+\eqref{eq:fusion}, then combine them with fixed weights:
+\begin{equation}
+\boxed{\;S(\bm u)=\sum_{T\in\mathcal T}\omega_T\,S_T(\bm u)\cdot m_{\text{brain}}(\bm u),
+\qquad \bm\omega=(0.25,0.45,0.30).\;}
+\label{eq:multiscale}
+\end{equation}
+$m_{\text{brain}}$ is the brain mask (a 2-px erosion removes the skull rim while
+sparing cortical lesions). Equation~\eqref{eq:multiscale} is computed by
+\texttt{MultiScaleScorer.score\_slice}.
+
+\section{Healthy-set calibration and thresholding}
+The operating threshold is set \emph{without ever seeing a lesion}. On $N$
+held-out healthy slices we pool all brain-voxel scores and take a high
+percentile,
+\begin{equation}
+\tau=\mathrm{Percentile}_{95}\big(\{S(\bm u):\bm u\in m_{\text{brain}},\;\x\text{ healthy}\}\big),
+\qquad \hat P(\bm u)=\mathbf 1\!\left[S(\bm u)>\tau\right].
+\label{eq:tau}
+\end{equation}
+By construction $\tau$ passes (in expectation) only the top $5\%$ of healthy
+voxels, i.e.\ a controlled, label-free false-positive rate $\alpha=0.05$. A
+percentile is a Wilks (1941) order statistic: $\sim20/\alpha=400$ pooled samples
+suffice for a stable estimate, comfortably met by $N=150$--$200$ slices
+($\sim10^6$ voxels). This is \texttt{src/calibration/calibrator.py}.
+
+\section{Evaluation metrics}
+Given continuous scores $S$ and binary ground truth $G$ over brain voxels:
+\begin{align}
+\mathrm{AUROC}&=\Pr\!\big(S(\bm u_+)>S(\bm u_-)\big)
+=\int_0^1 \mathrm{TPR}\,d\,\mathrm{FPR}, \\[2pt]
+\mathrm{AUPRC}&=\int_0^1 \mathrm{Precision}\,d\,\mathrm{Recall}, \\[2pt]
+\mathrm{Dice}(\hat P,G)&=\frac{2\,|\hat P\cap G|}{|\hat P|+|G|}
+=\frac{2\,\mathrm{TP}}{2\,\mathrm{TP}+\mathrm{FP}+\mathrm{FN}}\;(=F_1).
+\label{eq:metrics}
+\end{align}
+AUROC/AUPRC are \emph{threshold-free} (pure ranking quality); Dice depends on the
+threshold and is reported at three operating points --- the calibrated $\tau$ of
+\eqref{eq:tau} (deployable), the best single global threshold (realistic
+ceiling), and the per-slice oracle (upper bound). The spread between them
+diagnoses whether error is in the \emph{score} or only in the \emph{threshold}.
+
+% ===========================================================================
+\part*{Part IV\quad Explainability (XAI) mathematics}
+\addcontentsline{toc}{section}{Part IV — XAI}
+\label{part:xai}
+% ===========================================================================
+
+\section{Counterfactual explanation (primary)}
+A diffusion UAD model answers an inherently \emph{counterfactual} question:
+``what would this brain look like if it were healthy?'' The reconstruction
+$\hat{\x}_0^{\text{healthy}}$ \emph{is} the counterfactual $\x'$, and the anomaly
+map $|\x-\x'|$ is the counterfactual difference --- the minimal change that moves
+the input onto the healthy manifold (Wachter et al., 2017; Sanchez et al., 2022).
+This explanation is \textbf{faithful by construction}: it is exactly the quantity
+the model thresholds, not a post-hoc surrogate. The DDIM map of
+\S\ref{sec:partial} approximates the projection onto $\mathcal M_h$ in the
+metric induced by the learned score, so $\x'$ is, approximately, the nearest
+healthy explanation of $\x$. The ``healing trajectory'' visualises the iterates
+of \eqref{eq:ddim} in-painting the lesion.
+
+\section{Grad-CAM for a denoiser (model-focus)}
+Counterfactuals say \emph{what} changed; Grad-CAM (Selvaraju et al., 2017) says
+\emph{where the network looked}. A denoiser has no class logit, so we explain its
+own training target evaluated at the centre scoring scale,
+\begin{equation}
+y(\x_0,t)=\big\|\eps_\theta(\x_t,t)-\bm n\big\|_2^2,
+\qquad \x_t=\sqrt{\abar_t}\,\x_0+\sqrt{1-\abar_t}\,\bm n,
+\label{eq:gradcam-target}
+\end{equation}
+which is large precisely where the network \emph{fails} to denoise as if healthy
+--- the anomaly. Let $\bm A^{k}$ be the $k$-th channel of a high-resolution
+decoder feature map (the last up-block). The Grad-CAM weight and map are
+\begin{equation}
+\alpha_k=\frac{1}{HW}\sum_{i,j}\frac{\partial y}{\partial A^{k}_{ij}},
+\qquad
+L_{\text{Grad-CAM}}=\ReLU\!\Big(\sum_k \alpha_k\,\bm A^{k}\Big),
+\label{eq:gradcam}
+\end{equation}
+upsampled to $P\times P$, min--max normalised, and fused across patches with
+\eqref{eq:fusion} into a slice-level model-focus map directly comparable to $S$
+and $G$. The gradients in \eqref{eq:gradcam} are obtained by one backward pass of
+$y$ onto the cached activation (\texttt{src/xai/gradcam.py}); this is the only
+part of the pipeline that runs \emph{with} gradients.
+
+\section{Additive attribution: modality and scale}
+Because both the residual \eqref{eq:residual} and the multi-scale score
+\eqref{eq:multiscale} are \emph{linear} combinations, attribution is exact (no
+approximation): each term is a literal contribution.
+\begin{equation}
+S=\sum_{k\in\mathcal K}\underbrace{\bar w_k\, r_k}_{\text{modality } k}
+=\sum_{T\in\mathcal T}\underbrace{\omega_T\,S_T}_{\text{scale } T}.
+\end{equation}
+The \emph{dominant modality} $\arg\max_k \sum_{\bm u}\bar w_k r_k(\bm u)$ indicates
+whether a lesion is driven by FLAIR (edema) or contrast (active tumour); the
+\emph{dominant scale} indicates lesion size (low-$T$ = fine, high-$T$ =
+structural). These are \texttt{modality\_attribution} / \texttt{scale\_attribution}
+(\texttt{src/xai/attribution.py}). An attention-rollout view (Abnar \& Zuidema,
+2020), aggregating the UNet self-attention magnitudes, is available as a
+complementary model-internal saliency.
+
+% ===========================================================================
+\part*{Part V\quad Reading the numbers}
+\addcontentsline{toc}{section}{Part V — Reading the numbers}
+\label{part:numbers}
+% ===========================================================================
+
+\section{Training numbers}
+\paragraph{The loss scale.} The injected noise $\bm n$ is normalised to unit
+variance, so a trivial predictor $\eps_\theta\!\equiv\!\bm0$ attains
+$\mathcal L_{\text{simple}}=\E\|\bm n\|^2/(CP^2)\approx 1.0$. Hence
+$\mathcal L_{\text{simple}}\in[0,1]$ in practice and
+$1-\mathcal L_{\text{simple}}$ is, approximately, the \emph{fraction of noise
+variance the model explains}. A training loss of $\sim$0.09 corresponds to
+explaining $\sim$90\% of the injected-noise variance --- the network has learned
+a strong healthy-denoising score function.
+\paragraph{Train vs.\ validation.} Validation runs the EMA weights on held-out
+healthy patches. A validation loss \emph{higher} than training (e.g.\ $0.26$ vs.\
+$0.09$ early on) is expected --- different patches, EMA lag --- and is not
+over-fitting; what matters is that \emph{validation} trends \emph{down} across
+epochs and then plateaus, which is the early-stopping signal (patience $6$). A
+validation loss that rises while training falls would indicate over-fitting; the
+patch amplification of \S\ref{part:pdm} makes this unlikely.
+\paragraph{Steps, not epochs.} With the 250k-patch-per-epoch cap, one epoch is
+$\sim$977 optimiser steps; $\sim$4--5 capped epochs already exceed the gradient
+budget of a far longer un-capped run on a smaller dataset, which is why a
+few-epoch pilot is legitimate. Convergence should be read off the
+\emph{validation curve}, not the epoch count.
+
+\section{Inference numbers}
+\paragraph{AUROC vs.\ Dice.} A high AUROC with a low calibrated Dice means the
+score \emph{ranks} lesion voxels correctly but the single global threshold
+\eqref{eq:tau} cannot cleanly separate them --- typically because a second,
+non-lesion structure (e.g.\ a reconstruction edge rim) also exceeds $\tau$. The
+\emph{best-global} and \emph{oracle} Dice quantify how much of the gap is
+threshold-induced versus intrinsic to the score: a large oracle$-$calibrated gap
+means ``fix the threshold/artefact,'' a small one means ``improve the score.''
+\paragraph{Per-scale / per-modality readouts.} The scale weights $\bm\omega$ and
+the dominant-modality statistic turn each detection into a clinically legible
+statement (lesion size; FLAIR- vs.\ contrast-driven), and the per-scale Dice
+isolates which $T$ contributes most --- guidance for tuning $\mathcal T$.
+\paragraph{Grad-CAM sanity.} A trustworthy model-focus map \eqref{eq:gradcam}
+concentrates on the lesion and co-localises with both the anomaly score $S$ and
+the ground truth $G$; diffuse or edge-locked Grad-CAM indicates the network is
+keying on artefacts rather than pathology, an independent check on the score.
+
+\bigskip
+\hrule
+\bigskip
+\noindent\textit{Code cross-reference.} Eq.~\eqref{eq:simple}: \texttt{models/diffusion.py};
+Eqs.~\eqref{eq:x0hat}--\eqref{eq:ddim}: \texttt{models/diffusion.py} (DDIM);
+Eqs.~\eqref{eq:simplex}: \texttt{noise/simplex.py};
+Eqs.~\eqref{eq:fusion},\eqref{eq:multiscale},\eqref{eq:residual}: \texttt{scoring/};
+Eq.~\eqref{eq:tau}: \texttt{calibration/calibrator.py};
+Eqs.~\eqref{eq:gradcam-target}--\eqref{eq:gradcam}: \texttt{xai/gradcam.py}.
+
+\section*{Key references}
+\addcontentsline{toc}{section}{Key references}
+\begin{enumerate}[label={[\arabic*]},leftmargin=2.4em]
+\item Sohl-Dickstein, Weiss, Maheswaranathan, Ganguli (2015). \textit{Deep Unsupervised Learning using Nonequilibrium Thermodynamics}. ICML.
+\item Ho, Jain, Abbeel (2020). \textit{Denoising Diffusion Probabilistic Models}. NeurIPS.
+\item Song, Meng, Ermon (2021). \textit{Denoising Diffusion Implicit Models}. ICLR.
+\item Nichol, Dhariwal (2021). \textit{Improved Denoising Diffusion Probabilistic Models}. ICML.
+\item Wyatt, Leach, Schmon, Willcocks (2022). \textit{AnoDDPM: Anomaly Detection with DDPMs using Simplex Noise}. CVPR-W.
+\item Behrendt, Bhattacharya, Krüger, Opfer, Schlaefer (2023). \textit{Patched Diffusion Models for UAD in Brain MRI}. MIDL.
+\item Bercea et al.\ (2023). \textit{Generalizing Unsupervised Anomaly Detection}. MICCAI.
+\item Baur, Denner, Wiestler, Navab, Albarqouni (2021). \textit{Autoencoders for Unsupervised Anomaly Segmentation in Brain MR}. Med.\ Image Anal.
+\item Selvaraju et al.\ (2017). \textit{Grad-CAM}. ICCV.
+\item Wachter, Mittelstadt, Russell (2017). \textit{Counterfactual Explanations without Opening the Black Box}. Harvard JOLT.
+\item Sanchez, Kascenas, Liu, O'Neil, Tsaftaris (2022). \textit{Healthy/Pathological Brain Counterfactuals with Diffusion Models}. arXiv:2203.08089.
+\item Abnar, Zuidema (2020). \textit{Quantifying Attention Flow in Transformers}. ACL.
+\item Wilks (1941). \textit{Determination of Sample Sizes for Setting Tolerance Limits}. Ann.\ Math.\ Stat.
+\end{enumerate}
+
+\end{document}

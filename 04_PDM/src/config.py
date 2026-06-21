@@ -203,7 +203,7 @@ class TrainConfig:
     batch_size: int = 128
     lr: float = 2e-4
     weight_decay: float = 1e-4
-    warmup_epochs: int = 5
+    warmup_epochs: int = 1
     grad_clip_norm: float = 1.0
     ema_decay: float = 0.9999
     # bf16 autocast on Ampere+ (RunPod A100/A40). Falls back to fp32 elsewhere.
@@ -211,7 +211,7 @@ class TrainConfig:
     amp_dtype: str = "bfloat16"
     num_workers: int = 8
     seed: int = 42
-    early_stop_patience: int = 25
+    early_stop_patience: int = 6
     ckpt_every: int = 10
     log_every_steps: int = 50
     # Cap on patches sampled per epoch (None = use all). Keeps epochs bounded.

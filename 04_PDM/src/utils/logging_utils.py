@@ -2,10 +2,15 @@
 Logging utilities.
 ==================
 
-Provides a single ``get_logger`` factory and a ``setup_file_logging`` helper so
-every script logs consistently to both stdout and a per-run file. We use the
-stdlib ``logging`` module (never bare ``print``) so log level, formatting, and
-sinks are controlled centrally.
+Single place that configures logging so every module logs consistently to BOTH
+stdout (visible in the Colab cell / terminal) and a per-run file.
+
+Design: handlers live on the shared ``pdm`` parent logger. Every module logger is
+named ``pdm.<something>`` and *propagates* to that parent, so a single
+StreamHandler + (optionally) one FileHandler capture everything. (The previous
+version attached a handler per logger with ``propagate=False``, which meant the
+file handler on the parent never received child records — log files came out
+empty.)
 """
 
 from __future__ import annotations
@@ -17,36 +22,48 @@ from pathlib import Path
 
 _FORMAT = "%(asctime)s | %(levelname)-7s | %(name)-18s | %(message)s"
 _DATEFMT = "%H:%M:%S"
-_CONFIGURED: set[str] = set()
+_PARENT = "pdm"
+_parent_ready = False
+
+
+def _ensure_parent() -> logging.Logger:
+    """Configure the shared 'pdm' parent logger once (stdout handler)."""
+    global _parent_ready
+    parent = logging.getLogger(_PARENT)
+    if not _parent_ready:
+        parent.setLevel(logging.INFO)
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
+        parent.addHandler(sh)
+        parent.propagate = False  # don't double-log to the root logger
+        _parent_ready = True
+    return parent
 
 
 def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
-    """Return a console logger, configured once per name."""
+    """Return a module logger that propagates to the shared 'pdm' parent.
+
+    ``name`` should be ``pdm.<module>`` so handlers on the parent capture it.
+    """
+    _ensure_parent()
     logger = logging.getLogger(name)
-    if name not in _CONFIGURED:
-        logger.setLevel(level)
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
-        logger.addHandler(handler)
-        logger.propagate = False
-        _CONFIGURED.add(name)
+    logger.setLevel(level)
+    logger.propagate = True  # bubble up to the parent's handlers (stdout + file)
     return logger
 
 
 def setup_file_logging(log_dir: Path, run_name: str) -> Path:
-    """Attach a file handler to the root pipeline logger.
+    """Attach a file handler to the 'pdm' parent. Returns the log file path.
 
-    Returns the path of the created log file. Call once at the start of a script.
+    Call once at the start of a script. All ``pdm.*`` loggers then write to both
+    stdout and this file.
     """
+    parent = _ensure_parent()
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = log_dir / f"{run_name}_{stamp}.log"
 
-    file_handler = logging.FileHandler(log_path)
-    file_handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
-
-    # Attach to the shared 'pdm' parent so all child loggers propagate to file.
-    root = logging.getLogger("pdm")
-    root.setLevel(logging.INFO)
-    root.addHandler(file_handler)
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATEFMT))
+    parent.addHandler(fh)
     return log_path

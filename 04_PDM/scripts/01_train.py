@@ -40,6 +40,8 @@ def main() -> int:
     p.add_argument("--bs", type=int, default=CONFIG.train.batch_size)
     p.add_argument("--noise", type=str, default=CONFIG.noise.strategy,
                    choices=["simplex", "gaussian"])
+    p.add_argument("--resume", action="store_true",
+                   help="Resume from the last saved training state (Colab-safe).")
     p.add_argument("--smoke", action="store_true")
     args = p.parse_args()
 
@@ -72,7 +74,7 @@ def main() -> int:
 
         process = DiffusionProcess(build_noise_strategy(args.noise))
         unet = build_unet()
-        trainer = Trainer(unet, process, device, epochs=epochs)
+        trainer = Trainer(unet, process, device, epochs=epochs, resume=args.resume)
         result = trainer.fit(train_loader, val_loader)
         log.info("Best val %.5f @ epoch %d. Next: scripts/02_calibrate.py",
                  result["best_val"], result["best_epoch"])

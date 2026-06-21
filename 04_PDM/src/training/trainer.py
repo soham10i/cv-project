@@ -18,6 +18,7 @@ Refs:
 from __future__ import annotations
 
 import csv
+import time
 
 import torch
 from torch.optim import AdamW
@@ -44,6 +45,7 @@ class Trainer:
         process: DiffusionProcess,
         device: torch.device,
         epochs: int = CONFIG.train.epochs,
+        resume: bool = False,
     ) -> None:
         self.unet = unet.to(device)
         self.process = process
@@ -69,6 +71,48 @@ class Trainer:
         self.ckpt = CheckpointManager(CONFIG.paths.checkpoints_dir)
         self.stopper = EarlyStopping(cfg.early_stop_patience)
         self._metrics_path = CONFIG.paths.logs_dir / "train_metrics.csv"
+        # Full training state (model + EMA + optimizer + scheduler + bookkeeping)
+        # for crash-safe resume — essential on Colab where sessions disconnect.
+        self._state_path = CONFIG.paths.checkpoints_dir / "last_state.pt"
+        self.start_epoch = self._maybe_resume() if resume else 0
+
+    # ── crash-safe resume ──────────────────────────────────────────────────
+    def _save_full_state(self, epoch: int) -> None:
+        """Persist everything needed to continue training from epoch+1."""
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "epoch": epoch,
+                "unet": self.unet.state_dict(),
+                "ema": self.ema.shadow.state_dict(),
+                "opt": self.opt.state_dict(),
+                "sched": self.sched.state_dict(),
+                "scaler": self.scaler.state_dict(),
+                "ckpt_best": self.ckpt.best,
+                "stop_best": self.stopper.best,
+                "stop_counter": self.stopper.counter,
+                "stop_best_epoch": self.stopper.best_epoch,
+            },
+            self._state_path,
+        )
+
+    def _maybe_resume(self) -> int:
+        """Reload full state if a checkpoint exists; return the epoch to resume after."""
+        if not self._state_path.exists():
+            log.info("Resume requested but no state at %s — starting fresh.", self._state_path)
+            return 0
+        st = torch.load(self._state_path, map_location=self.device)
+        self.unet.load_state_dict(st["unet"])
+        self.ema.shadow.load_state_dict(st["ema"])
+        self.opt.load_state_dict(st["opt"])
+        self.sched.load_state_dict(st["sched"])
+        self.scaler.load_state_dict(st["scaler"])
+        self.ckpt.best = st["ckpt_best"]
+        self.stopper.best = st["stop_best"]
+        self.stopper.counter = st["stop_counter"]
+        self.stopper.best_epoch = st["stop_best_epoch"]
+        log.info("Resumed from epoch %d (best val %.5f).", st["epoch"], self.stopper.best)
+        return int(st["epoch"])
 
     # ── one epoch ─────────────────────────────────────────────────────────
     def _train_epoch(self, loader: DataLoader, epoch: int) -> float:
@@ -111,25 +155,34 @@ class Trainer:
     # ── full fit ──────────────────────────────────────────────────────────
     def fit(self, train_loader: DataLoader, val_loader: DataLoader) -> dict:
         CONFIG.paths.logs_dir.mkdir(parents=True, exist_ok=True)
-        with self._metrics_path.open("w", newline="") as f:
-            csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "lr"])
+        # Only write the CSV header on a fresh run; on resume we append.
+        if self.start_epoch == 0 or not self._metrics_path.exists():
+            with self._metrics_path.open("w", newline="") as f:
+                csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "lr"])
 
-        log.info("Training | %d epochs | bs %d | lr %.1e | noise=%s | amp=%s",
-                 self.epochs, CONFIG.train.batch_size, CONFIG.train.lr,
-                 self.process.noise.name, self.amp)
+        log.info("Training | epochs %d→%d | bs %d | lr %.1e | noise=%s | amp=%s",
+                 self.start_epoch + 1, self.epochs, CONFIG.train.batch_size,
+                 CONFIG.train.lr, self.process.noise.name, self.amp)
 
-        for epoch in range(1, self.epochs + 1):
+        for epoch in range(self.start_epoch + 1, self.epochs + 1):
+            t_ep = time.perf_counter()
             train_loss = self._train_epoch(train_loader, epoch)
             val_loss = self._validate(val_loader)
             self.sched.step()
             lr = self.opt.param_groups[0]["lr"]
-            log.info("Epoch %d/%d | train %.5f | val %.5f | lr %.2e",
-                     epoch, self.epochs, train_loss, val_loss, lr)
+            dt = time.perf_counter() - t_ep
+            # Per-epoch wall-time + projected ETA so you can verify the budget
+            # after the very first epoch instead of guessing.
+            eta_h = dt * (self.epochs - epoch) / 3600.0
+            log.info("Epoch %d/%d | train %.5f | val %.5f | lr %.2e | %.1fs | ETA %.1fh",
+                     epoch, self.epochs, train_loss, val_loss, lr, dt, eta_h)
 
             with self._metrics_path.open("a", newline="") as f:
                 csv.writer(f).writerow([epoch, train_loss, val_loss, lr])
 
             self.ckpt.save_best(self.unet, self.ema, val_loss)
+            # Always refresh the full-state snapshot so a disconnect costs ≤1 epoch.
+            self._save_full_state(epoch)
             if epoch % CONFIG.train.ckpt_every == 0:
                 self.ckpt.save_periodic(self.ema, epoch)
             if self.stopper.step(val_loss, epoch):
