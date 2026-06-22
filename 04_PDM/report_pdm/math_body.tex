@@ -246,7 +246,7 @@ detector toward the blob-like spatial scale of tumours.
 The model operates on overlapping $P\times P=96\times96$ patches (stride $16$)
 rather than whole slices. With $\sim$196 patches per slice, a few thousand
 healthy slices become $\sim$570k training samples --- a $\sim$196$\times$ data
-amplification that is decisive in the low-patient pediatric regime --- and the
+amplification that is particularly useful in the low-patient pediatric regime --- and the
 network is forced to learn a \emph{local} texture model of healthy tissue, which
 generalises better than a global one and cannot ``memorise'' whole-slice layout.
 Each patch is an independent draw of \eqref{eq:simple}.
@@ -418,9 +418,12 @@ The \emph{dominant modality} $\arg\max_k \sum_{\bm u}\bar w_k r_k(\bm u)$ indica
 whether a lesion is driven by FLAIR (edema) or contrast (active tumour); the
 \emph{dominant scale} indicates lesion size (low-$T$ = fine, high-$T$ =
 structural). These are \texttt{modality\_attribution} / \texttt{scale\_attribution}
-(\texttt{src/xai/attribution.py}). An attention-rollout view (Abnar \& Zuidema,
-2020), aggregating the UNet self-attention magnitudes, is available as a
-complementary model-internal saliency.
+(\texttt{src/xai/attribution.py}). In future work, attention-rollout maps (Abnar
+\& Zuidema, 2020) --- which trace the UNet's self-attention weights at the
+12$\times$12 bottleneck back to input spatial positions --- could provide a
+model-internal view to complement the external counterfactual explanation. The
+config flag \texttt{attention\_rollout} is wired; the visualisation pipeline has
+not been implemented yet.
 
 % ===========================================================================
 \part*{Part V\quad Reading the numbers}

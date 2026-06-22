@@ -1,0 +1,751 @@
+% =====================================================================
+% PDM — Patch-Diffusion Pipeline: Implementation-Grounded Walkthrough
+% A reverse-engineering / teaching document built from the source code
+% and the training / calibration / evaluation logs in outputs/.
+%
+% Compile:  pdflatex pipeline_walkthrough.tex   (run twice for the ToC)
+%        or upload to Overleaf.  Standard packages only — no figures
+%        are \include-d, so it compiles stand-alone.
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[a4paper,margin=22mm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage[colorlinks=true,linkcolor=blue!50!black,urlcolor=red!50!black]{hyperref}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\newcommand{\x}{\bm{x}}
+\newcommand{\eps}{\bm{\epsilon}}
+\newcommand{\II}{\mathbf{I}}
+\newcommand{\abar}{\bar{\alpha}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\definecolor{codebg}{gray}{0.96}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  breaklines=true, frame=single, framesep=4pt,
+  columns=fullflexible, keepspaces=true, showstringspaces=false,
+}
+
+\title{\textbf{The Patch-Diffusion (PDM) Pipeline:\\
+A Sequential, Implementation-Grounded Walkthrough}\\[4pt]
+\large From a raw BraTS-PEDs volume to the final anomaly metrics}
+\author{Reverse-engineered from the source code and the \code{outputs/} logs}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This document is a complete, sequential explanation of the pixel-space
+\emph{patch-diffusion} pipeline for unsupervised anomaly detection (UAD) in
+pediatric brain MRI, as it is \emph{actually implemented} in this repository. It
+follows the data from a raw 3-D NIfTI volume, through preprocessing, patch
+extraction, the forward diffusion process, the U-Net denoiser, training,
+partial-noise reconstruction at inference, multi-scale residual scoring,
+threshold calibration, evaluation, and finally explainability. Every claim is
+tied to a specific file, function, configuration value, or log line. Where the
+code and the logs are mutually inconsistent (there are two such places), the
+ambiguity is stated explicitly rather than papered over. Dimensions are traced
+layer-by-layer; the relevant mathematics is given with every symbol defined and
+an intuitive reading for this specific project.
+\end{abstract}
+
+\tableofcontents
+\clearpage
+
+% =====================================================================
+\section{System overview}
+% =====================================================================
+
+\subsection{What the system does, in one paragraph}
+A denoising diffusion model is trained \emph{only} on $96\times96$ patches of
+\emph{healthy} brain tissue, so it learns what healthy anatomy looks like. At
+test time, each slice of an unseen patient is cut into overlapping patches; every
+patch is partially corrupted with noise and then denoised back by the model. The
+model can only reconstruct toward healthy anatomy, so healthy tissue returns
+almost unchanged while a lesion is ``healed'' into plausible healthy tissue. The
+pixel-wise difference between the original patch and its healthy reconstruction
+(the \emph{residual}) is therefore large exactly where the anatomy is abnormal.
+These residuals are fused back into a full-slice anomaly map, thresholded at a
+value calibrated on healthy data, and compared against the radiologist's lesion
+mask to produce AUROC, AUPRC and Dice.
+
+\subsection{End-to-end stage map}
+The pipeline is a linear sequence of stages, each owned by one module:
+
+\begin{longtable}{@{}rll@{}}
+\toprule
+\# & Stage & Implementation \\
+\midrule
+\endhead
+1  & Preprocess NIfTI $\to$ normalized 2-D slices & \code{src/data/preprocessing.py}, \code{normalization.py} \\
+2  & Build healthy / val / test manifests        & \code{preprocessing.py} (writes \code{manifests/*.txt}) \\
+3  & Patch index + dataset                        & \code{src/data/patches.py}, \code{dataset.py} \\
+4  & Forward (noising) process                    & \code{src/models/diffusion.py}, \code{src/noise/simplex.py} \\
+5  & U-Net $\eps$-predictor                        & \code{src/models/unet.py} (\code{diffusers.UNet2DModel}) \\
+6  & Training loop (AdamW + EMA + AMP)            & \code{src/training/trainer.py}, \code{models/ema.py} \\
+7  & Partial-noise DDIM reconstruction (inference)& \code{diffusion.py::reconstruct} \\
+8  & Residual + modality weighting + CE channel   & \code{src/scoring/residual.py} \\
+9  & Multi-scale scoring + Gaussian fusion        & \code{src/scoring/multiscale.py}, \code{data/patches.py} \\
+10 & Threshold calibration on healthy slices      & \code{src/calibration/calibrator.py} \\
+11 & Evaluation + metrics                         & \code{src/evaluation/evaluator.py}, \code{metrics.py} \\
+12 & Explainability (counterfactual + attribution)& \code{src/xai/counterfactual.py}, \code{attribution.py} \\
+\bottomrule
+\end{longtable}
+
+\noindent
+All constants live in a single frozen-dataclass config,
+\code{src/config.py}, exported as the shared instance \code{CONFIG}. Every value
+quoted in this document is the default in that file unless a log shows it was
+overridden at run time.
+
+\subsection{The hardware and the two training runs (from the logs)}
+The logs in \code{outputs/logs/} record \emph{two} runs on the same machine,
+\textbf{NVIDIA A100-SXM4-80GB} (Google Colab, High-RAM):
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \textbf{Pilot run} (\code{pilot\_training.log}, 2026-06-19): the full,
+uncapped patch set --- \emph{2{,}088{,}400 train patches}, 5438 steps/epoch,
+scheduled for 250 epochs.
+\item \textbf{Final run} (\code{train.log}, 2026-06-19/20): a capped run ---
+\emph{250{,}000 train patches/epoch}, 714 steps/epoch, 60 epochs, resumed from
+epoch 8. This is the run whose checkpoint produced all reported results.
+\end{itemize}
+
+% =====================================================================
+\section{Stage 1 — Data loading and preprocessing}
+% =====================================================================
+
+\subsection{Input: the four BraTS-PEDs modalities}
+Each patient folder holds four co-registered, skull-stripped 3-D MRI volumes plus
+an expert segmentation (\code{preprocessing.py::\_load\_patient}):
+\code{t1n} (native T1), \code{t1c} (contrast-enhanced T1), \code{t2w} (T2),
+\code{t2f} (T2-FLAIR), and \code{seg} (lesion labels, used \emph{only} for
+evaluation). The channel order is fixed by
+\code{CONFIG.data.modalities = (t1n, t1c, t2w, t2f)} and is relied upon
+downstream (the contrast-enhancement channel is computed as channel-1 minus
+channel-0).
+
+\subsection{Robust intensity normalization}
+Each modality volume is normalized independently
+(\code{normalization.py::robust\_normalize\_volume}). Foreground (non-zero)
+voxels only are used to compute the $[0.5, 99.5]$ percentiles
+$(\ell, h)$; the volume is clipped to $[\ell,h]$ and mapped affinely to $[-1,1]$:
+\begin{equation}
+\tilde v \;=\; 2\,\frac{\mathrm{clip}(v,\ell,h)-\ell}{h-\ell}\;-\;1,
+\qquad \tilde v\big|_{v=0} := -1 .
+\end{equation}
+\textbf{Symbols.} $v$ is a raw voxel intensity; $\ell,h$ are the low/high
+foreground percentiles; $\tilde v\in[-1,1]$ is the normalized value; background
+voxels (exactly $0$) are forced to the constant $-1$.
+
+\textbf{Why this and not $\pm3\sigma$.} Percentile clipping at $99.5\%$ keeps the
+hyper-intense FLAIR/enhancement signal that marks tumour. Hard $\sigma$-clipping
+would truncate exactly that signal. The constant $-1$ background gives the model
+a clean, predictable ``empty'' value, which later defines the brain mask.
+
+\subsection{Slicing, resizing, and the foreground gate}
+Volumes are sliced axially; each 2-D slice is centre-cropped/padded to
+$256\times256$ with $-1$ padding (\code{\_resize\_slice}). The four modalities are
+stacked into a $(4,256,256)$ \code{float16} array and saved as
+\code{slices/<pid>\_z<NNN>.npy}. A slice is discarded if its foreground fraction
+is below \code{min\_foreground\_frac}; note the config default is $0.02$ while the
+docstring mentions a stricter intent --- the \emph{code} value $0.02$ is what
+ran. Lesion slices additionally get a binary mask saved under \code{masks/}.
+
+\subsection{Healthy filtering with a lesion buffer (leakage control \#1)}
+A slice is admitted to the \emph{healthy} training pool only if it is lesion-free
+\emph{and} at least \code{healthy\_buffer = 3} slices away from any lesion slice
+(\code{\_healthy\_slice\_flags}). This buffer prevents tumour mass-effect and
+partial-volume tissue immediately adjacent to a lesion from leaking into the
+``healthy'' manifold; without it the model would partly learn peri-tumoural
+appearance and then fail to flag it.
+
+\subsection{Patient-level splits and the three manifests (leakage control \#2)}
+Splits are read from \code{splits/\{train,val,test\}.txt} at the
+\emph{patient} level, so no slice of a test patient is ever seen in training or
+calibration. Preprocessing emits three manifests:
+\begin{itemize}[leftmargin=1.4em,itemsep=0pt]
+\item \code{healthy.txt} --- healthy+buffer slices from \emph{train} patients (diffusion training);
+\item \code{val\_healthy.txt} --- lesion-free slices from \emph{val} patients (threshold calibration);
+\item \code{test\_anom.txt} --- lesion slices from \emph{test} patients (evaluation).
+\end{itemize}
+The diffusion model and the residual score use \emph{no} masks at all; masks
+enter only in the final metric computation. This is the structural reason the
+reported numbers are not optimistically biased.
+
+% =====================================================================
+\section{Stage 2 — Patches and datasets}
+% =====================================================================
+
+\subsection{Why patches}
+Whole-slice reconstruction UAD is dominated by brain-boundary edge artefacts and
+is starved of data when only $\sim$30 patients are available. Operating on small
+overlapping patches (a) multiplies the effective dataset size by two orders of
+magnitude and (b) forces a \emph{local} texture model that cannot memorise the
+global slice layout (\code{patches.py} docstring; Behrendt et al., 2023).
+
+\subsection{Patch tiling --- exact geometry}
+\code{iter\_patch\_coords(image\_size, patch\_size, stride)} tiles the slice with
+overlap, clamping the final row/column so the edge is always covered. For the
+actual values $256$, $96$, $16$:
+\[
+\text{tops} = \{0,16,32,\dots,160\}\;(11\text{ positions}),
+\qquad \#\text{patches/slice} = 11^2 = \boxed{121}.
+\]
+\textbf{Note (code vs.\ comment).} The \code{PatchConfig} docstring estimates
+``$\sim$196 patches/slice''; the \emph{actual} tiling produces $121$. The $121$
+figure is what the implementation computes and what the patch-batch timing below
+is consistent with.
+
+\subsection{The two datasets}
+\code{HealthyPatchDataset} (\code{dataset.py}) builds a flat
+\code{(stem, top, left)} index over all healthy slices, using memory-mapped reads
+so only each candidate patch region is touched, and \emph{drops background-only
+patches} via \code{patch\_foreground\_fraction} $\ge$
+\code{min\_patch\_foreground}$=0.10$. \code{\_\_getitem\_\_} materialises a single
+$(4,96,96)$ \code{float32} patch and applies training augmentation:
+horizontal flip (valid under approximate bilateral symmetry, $p{=}0.5$) and a
+small multiplicative intensity jitter ($\pm5\%$, $p{=}0.3$).
+
+\code{AnomalousSliceDataset} returns whole $(4,256,256)$ test slices with their
+$(256,256)$ lesion masks; patching is deferred to the evaluator so that Gaussian
+fusion can run over the whole slice.
+
+% =====================================================================
+\section{Stage 3 — The forward (noising) diffusion process}
+% =====================================================================
+
+\subsection{Closed-form forward kernel}
+With a variance schedule $\beta_1,\dots,\beta_T$, define
+$\alpha_t = 1-\beta_t$ and $\abar_t=\prod_{s\le t}\alpha_s$. The forward process
+admits the closed form used in \code{diffusion.py::add\_noise} (which calls the
+\code{diffusers} \code{DDPMScheduler.add\_noise}):
+\begin{equation}
+\label{eq:forward}
+\x_t = \sqrt{\abar_t}\,\x_0 + \sqrt{1-\abar_t}\,\eps,
+\qquad
+q(\x_t\mid\x_0)=\N\!\big(\sqrt{\abar_t}\,\x_0,\;(1-\abar_t)\II\big).
+\end{equation}
+\textbf{Symbols.} $\x_0$ is a clean healthy patch; $t\in\{0,\dots,T-1\}$ is the
+diffusion timestep; $\abar_t\in(0,1]$ is the cumulative signal-retention factor
+($\abar_t\!\to\!1$ at $t{=}0$, $\abar_t\!\to\!0$ at $t{=}T$); $\eps$ is the
+injected noise; $\II$ is the identity covariance.
+\textbf{Intuition.} A single step jumps directly to any noise level $t$: keep a
+fraction $\sqrt{\abar_t}$ of the clean image and add $\sqrt{1-\abar_t}$ of noise.
+
+\subsection{Schedule (cosine)}
+\code{CONFIG.model}: $T=1000$, \code{beta\_schedule = "squaredcos\_cap\_v2"}
+(the Nichol \& Dhariwal cosine schedule), $\beta\in[10^{-4},2\times10^{-2}]$,
+\code{prediction\_type = "epsilon"}. The cosine schedule keeps more signal at
+high $t$ than a linear one, which empirically improves sample quality.
+
+\subsection{Simplex (correlated) noise --- the key UAD ingredient}
+Instead of white Gaussian noise, the forward process uses spatially
+\emph{correlated} simplex-like noise (\code{noise/simplex.py}). It is built as a
+sum of \code{octaves}$=6$ band-limited octaves: low-resolution Gaussian noise
+bicubically upsampled to $96\times96$, with amplitude decayed by
+\code{persistence}$=0.8$ and frequency grown by \code{lacunarity}$=2.0$ per
+octave, starting at \code{base\_frequency}$=16$. The sum is renormalized to unit
+variance per sample:
+\begin{equation}
+\bm n = \sum_{o=0}^{5} p^{o}\,\mathrm{up}\!\big(\bm g_o\big),
+\qquad
+\eps = \bm n \big/ \mathrm{std}(\bm n),
+\end{equation}
+where $\bm g_o$ is low-res Gaussian noise at octave $o$, $p=0.8$, and
+$\mathrm{up}(\cdot)$ is bicubic upsampling to patch size.
+\textbf{Why.} Correlated noise lives at the \emph{spatial scale of lesions}, so a
+lesion ``looks like noise'' to the denoiser and is in-painted with healthy
+tissue at test time, producing a large residual --- whereas white noise mostly
+attacks pixel-level detail. Unit-variance renormalization keeps the DDPM
+signal-to-noise schedule in Eq.~\eqref{eq:forward} valid.
+
+% =====================================================================
+\section{Stage 4 — The U-Net $\eps$-predictor (layer-by-layer)}
+% =====================================================================
+
+\subsection{Configuration}
+\code{unet.py::build\_unet} instantiates a \code{diffusers.UNet2DModel}. The saved
+\code{checkpoints/unet/config.json} confirms the exact built network:
+
+\begin{longtable}{@{}ll@{}}
+\toprule
+Field & Value \\
+\midrule
+\code{sample\_size}        & 96 \\
+\code{in\_channels / out\_channels} & 4 / 4 \\
+\code{block\_out\_channels}& $[64, 128, 256, 256]$ \\
+\code{layers\_per\_block}  & 2 \\
+\code{down\_block\_types}  & Down, Down, Down, \textbf{AttnDown} \\
+\code{up\_block\_types}    & \textbf{AttnUp}, Up, Up, Up \\
+\code{mid\_block\_type}    & UNetMidBlock2D (ResNet–Attn–ResNet) \\
+\code{attention\_head\_dim}& 8 \\
+\code{act\_fn}             & SiLU \\
+\code{norm\_num\_groups} / \code{norm\_eps} & 32 / $10^{-5}$ \\
+\code{time\_embedding\_type}& positional (sinusoidal) \\
+\code{dropout}            & 0.1 \\
+Parameter count (logged)  & \textbf{25.3\,M} \\
+\bottomrule
+\end{longtable}
+
+\noindent
+The level resolutions are $96\!\to\!48\!\to\!24\!\to\!12$. Because
+\code{attention\_resolutions}$=(12,)$, self-attention is applied \emph{only} at
+the $12\times12$ bottleneck level (and in the mid-block), keeping memory and
+parameter count low --- the right trade-off when training data is scarce.
+
+\subsection{What the network predicts}
+Given a noised patch $\x_t$ and timestep $t$, the network outputs
+$\eps_\theta(\x_t,t)\in\R^{4\times96\times96}$: an estimate of the noise that was
+added. This is the \code{.sample} field used in
+\code{diffusion.py::training\_loss} and \code{reconstruct}.
+
+\subsection{Dimensional walkthrough}
+For a batch of $B$ patches, tensors flow as follows. Downsampling happens
+\emph{after} each of the first three levels; the last (attention) down-level does
+not downsample, which is why the bottleneck is $12\times12$.
+
+\begin{longtable}{@{}lll@{}}
+\toprule
+Stage & Output shape $(C,H,W)$ & Notes \\
+\midrule
+\endhead
+Input patch                 & $4\times96\times96$   & 4 modalities \\
+\code{conv\_in} ($3{\times}3$) & $64\times96\times96$ & lift to base width \\
+Time embed                  & vector $256$          & sinusoidal($64$)$\to$MLP$\to$256, added in every ResBlock \\
+DownBlock 0 ($2\times$ResNet)& $64\times96\times96$ & then downsample $\to 64\times48\times48$ \\
+DownBlock 1 ($2\times$ResNet)& $128\times48\times48$& then downsample $\to 128\times24\times24$ \\
+DownBlock 2 ($2\times$ResNet)& $256\times24\times24$& then downsample $\to 256\times12\times12$ \\
+\textbf{AttnDown 3} ($2\times$ResNet+Attn)& $256\times12\times12$ & self-attention, no downsample \\
+Mid (ResNet–Attn–ResNet)    & $256\times12\times12$ & global mixing at bottleneck \\
+\textbf{AttnUp 3} (+skip, Attn)& $256\times24\times24$ & concat skip, attention, upsample \\
+UpBlock 2 (+skip)           & $256\times48\times48$ & concat skip, upsample \\
+UpBlock 1 (+skip)           & $128\times96\times96$ & concat skip, upsample \\
+UpBlock 0 (+skip)           & $64\times96\times96$  & concat skip (no further up) \\
+GroupNorm+SiLU+\code{conv\_out}& $4\times96\times96$ & predicted noise $\eps_\theta$ \\
+\bottomrule
+\end{longtable}
+
+\textbf{Residual blocks.} Each ResNet block is
+GroupNorm($32$)$\to$SiLU$\to$Conv$3{\times}3$, with the time embedding projected
+and \emph{added} after the first convolution, then
+GroupNorm$\to$SiLU$\to$Dropout($0.1$)$\to$Conv$3{\times}3$ and a skip addition
+(with a $1{\times}1$ conv when channel counts change). This is the standard DDPM
+residual block.
+\textbf{Skip connections.} The encoder feature maps at $96,48,24,12$ are
+concatenated onto the matching decoder level (doubling channels at the
+concatenation, which the first conv of each up-block reduces again), preserving
+fine spatial detail that pure up-convolution would lose.
+\textbf{Attention.} At $12\times12$, multi-head self-attention ($8$ heads) lets
+every spatial location attend to every other --- affordable because there are
+only $144$ tokens.
+
+% =====================================================================
+\section{Stage 5 — Training}
+% =====================================================================
+
+\subsection{Objective}
+\code{diffusion.py::training\_loss} samples a uniform timestep per patch,
+noises it via Eq.~\eqref{eq:forward}, and minimises the simple DDPM
+$\eps$-prediction loss:
+\begin{equation}
+\label{eq:loss}
+\mathcal L_{\text{simple}}
+= \E_{\x_0,\;t\sim\mathcal U\{0,T-1\},\;\eps}
+\big\|\,\eps - \eps_\theta(\x_t,t)\,\big\|_2^2 .
+\end{equation}
+\textbf{Reading the value.} Because $\eps$ is renormalized to unit variance, a
+loss of $\mathcal L$ means the model leaves a fraction $\mathcal L$ of the noise
+variance unexplained; the best validation loss $0.0604$ therefore corresponds to
+$\approx94\%$ of the injected-noise variance explained. (This is an intuitive
+reading, not an identity --- it holds because the target has unit variance.)
+
+\subsection{Optimisation ingredients (\code{trainer.py})}
+\begin{longtable}{@{}ll@{}}
+\toprule
+Component & Setting \\
+\midrule
+Optimizer        & AdamW, $\beta=(0.9,0.99)$, weight decay $10^{-4}$ \\
+Peak LR          & $2\times10^{-4}$ \\
+Schedule         & Linear warmup ($1$ epoch, start factor $0.1$) $\to$ cosine to $10^{-6}$ \\
+EMA              & decay $0.9999$ (shadow weights, used for validation \emph{and} inference) \\
+Mixed precision  & bf16 autocast (no GradScaler --- bf16 has fp32 range) \\
+Grad clipping    & global-norm $1.0$ \\
+Early stopping   & patience $6$ on EMA validation loss \\
+Checkpointing    & best-val + periodic every 10 ep + full crash-safe state every ep \\
+\bottomrule
+\end{longtable}
+
+\textbf{EMA matters here.} Validation (\code{\_validate}) and all downstream
+inference use the EMA shadow module, not the raw weights. EMA averages out the
+optimisation noise of the last steps and gives markedly cleaner reconstructions
+--- which directly improves residual quality.
+
+\textbf{Crash-safe resume.} \code{\_save\_full\_state} snapshots model+EMA+optimizer
++scheduler+bookkeeping every epoch, so a Colab disconnect costs at most one
+epoch. The final run's log confirms this: it ``\emph{Resumed from epoch 8}''.
+
+\subsection{What the logs actually show (final 60-epoch run)}
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item Device: \textbf{A100-SXM4-80GB}; \emph{Train patches} $=250{,}000$,
+\emph{Val patches} $=7744$.
+\item \textbf{714 optimiser steps/epoch}, $\approx565$\,s/epoch
+($\approx9.4$\,min), total $\approx9.4$\,h for 60 epochs.
+\item Validation loss falls smoothly: $0.17$ (ep 9, resumed) $\to 0.094$ (ep 25)
+$\to 0.074$ (ep 34) $\to 0.0625$ (ep 50) $\to$ \textbf{best $0.06040$ at epoch 58}.
+\item Final line: \code{DONE — best val 0.06040 @ epoch 58}; epoch 60 val
+$0.06093$.
+\end{itemize}
+
+\textbf{Convergence reading.} Training loss ($\approx0.042$) and validation loss
+($\approx0.060$) track each other with a small, stable gap and no upward
+divergence --- i.e.\ \emph{neither under- nor over-fitting}. The $\sim$570k-patch
+amplification is doing its job: the model is data-rich at the patch level even
+though it has seen few patients. This is important later: it lets the failure
+analysis \emph{exclude} training pathology as the cause of weak segmentation.
+
+\subsection{Ambiguity: the logged batch size is unreliable}
+\code{trainer.py} logs \code{CONFIG.train.batch\_size} (``\code{bs 128}''), but the
+\emph{DataLoader} in \code{scripts/01\_train.py} is built with \code{args.bs}
+(which defaults to the config but can be overridden on the command line). The
+step counts prove the printed value is not the effective one:
+\[
+\text{final run: } \frac{250{,}000}{714}\approx 350,
+\qquad
+\text{pilot run: } \frac{2{,}088{,}400}{5438}\approx 384 .
+\]
+So the \textbf{effective batch size was $\approx$350 (final) / $\approx$384
+(pilot)}, not $128$. The ``\code{bs 128}'' line is a logging artefact (it prints
+the config default rather than \code{args.bs}). Any hyperparameter table should
+quote the effective value, or simply ``$\approx$350'', rather than the logged
+128.
+
+% =====================================================================
+\section{Stage 6 — Inference: partial-noise DDIM reconstruction}
+% =====================================================================
+
+\subsection{The reconstruction primitive}
+\code{diffusion.py::reconstruct} is the inference heart. A clean test patch
+$\x_0$ is noised \emph{only} to an intermediate level $t_{\text{int}}$ (not to
+pure noise), then deterministically denoised with DDIM ($\eta=0$):
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt]
+\item add noise to $t_{\text{int}}$ via the DDIM scheduler's \code{add\_noise}
+(same closed form as Eq.~\eqref{eq:forward}, with \emph{simplex} noise);
+\item iterate the DDIM update from $t_{\text{int}}$ down to $0$.
+\end{enumerate}
+
+\subsection{DDIM update}
+At each step the model first forms the clean-image estimate
+\begin{equation}
+\hat\x_0(\x_t,t)=\frac{\x_t-\sqrt{1-\abar_t}\,\eps_\theta(\x_t,t)}{\sqrt{\abar_t}},
+\end{equation}
+then takes the deterministic ($\eta=0$) DDIM step
+\begin{equation}
+\x_{t-1}=\sqrt{\abar_{t-1}}\;\hat\x_0(\x_t,t)\;+\;\sqrt{1-\abar_{t-1}}\;\eps_\theta(\x_t,t).
+\end{equation}
+\textbf{Symbols.} $\hat\x_0$ is the running estimate of the healthy clean patch;
+$\eps_\theta$ is the network's noise prediction; $\eta=0$ makes the trajectory
+deterministic (no added randomness), so the only stochasticity is the initial
+noise draw.
+\textbf{Intuition.} Healthy texture is on the manifold the model learned, so it
+is reconstructed almost exactly; a lesion is off-manifold and gets pulled toward
+the nearest healthy appearance --- it is ``healed''.
+
+\subsection{How many reverse steps actually run}
+\code{\_inference\_timesteps} sets the full DDIM grid to
+$\max\!\big(\text{ddim\_steps},\,\mathrm{round}(\text{ddim\_steps}\cdot T/t_{\text{int}})\big)$
+and then keeps only timesteps $\le t_{\text{int}}$. With
+\code{ddim\_steps}$=50$ and $T=1000$ this yields $\approx$\textbf{50 reverse
+steps at every scale}:
+\[
+t_{\text{int}}{=}50\!:\,\text{grid }1000\!\to\!51\text{ kept};\quad
+t_{\text{int}}{=}150\!:\,\text{grid }333\!\to\!51;\quad
+t_{\text{int}}{=}250\!:\,\text{grid }200\!\to\!50 .
+\]
+This is a neat design: the step \emph{count} is held roughly constant across
+scales while the step \emph{size} adapts, so each scale costs the same compute.
+
+% =====================================================================
+\section{Stage 7 — Residual, modality weighting, and the CE channel}
+% =====================================================================
+
+\subsection{Per-channel residual}
+\code{residual.py::residual\_stack} computes the absolute reconstruction error
+per modality and appends a contrast-enhancement (CE) residual channel:
+\begin{equation}
+r_k=\big|\x_0^{(k)}-\hat\x_0^{(k)}\big|\ (k=1..4),
+\qquad
+r_{\text{CE}}=\Big|\big(\x_0^{(2)}-\x_0^{(1)}\big)-\big(\hat\x_0^{(2)}-\hat\x_0^{(1)}\big)\Big|,
+\end{equation}
+where channels $1{=}t1n$, $2{=}t1c$. The CE term tracks errors in the
+\emph{gadolinium enhancement} signal $t1c-t1n$, a primary marker of active
+tumour that is invisible to pipelines dropping native T1. The saved
+\code{numpy\_dumps/*.npz} confirm a $(5,256,256)$ residual stack (4 modalities +
+CE) and a $(4,256,256)$ healthy reconstruction.
+
+\subsection{Modality-weighted scalar map}
+\code{weighted\_residual} normalizes the salience weights
+$\bm w\propto(0.5,1.0,0.75,1.5)$ for $(t1n,t1c,t2w,t2f)$ plus
+$w_{\text{CE}}=1.0$, then forms the brain-masked weighted sum:
+\begin{equation}
+S_{\text{patch}}(\bm u)=\Big(\sum_{k}\bar w_k\,r_k(\bm u)\Big)\,m_{\text{brain}}(\bm u),
+\qquad \bar w_k=\frac{w_k}{\sum_j w_j}.
+\end{equation}
+FLAIR ($t2f$, weight $1.5$) and contrast ($t1c$, weight $1.0$) dominate, matching
+where tumour signal lives. The brain mask
+(\code{residual.py::brain\_mask\_2d}) is the foreground (any channel $>-1$),
+hole-filled, then eroded by $2$\,px to drop the skull-strip rim while keeping
+peripheral cortical lesions.
+
+% =====================================================================
+\section{Stage 8 — Multi-scale scoring and Gaussian fusion}
+% =====================================================================
+
+\subsection{Per slice}
+\code{multiscale.py::score\_slice}:
+\begin{enumerate}[leftmargin=1.5em,itemsep=1pt]
+\item extract the $121$ overlapping patches of the slice;
+\item for each scale $T\in\{50,150,250\}$, reconstruct every patch
+(mini-batched, \code{patch\_batch}$=64$) and compute its weighted residual;
+\item fuse the patch residuals into a full-slice map with a centred Gaussian
+window;
+\item combine the three single-scale maps with weights $(0.25,0.45,0.30)$.
+\end{enumerate}
+
+\subsection{Gaussian fusion}
+\code{patches.py::GaussianPatchFuser} weights each patch's contribution by a
+centred Gaussian ($\sigma=32$\,px) so a patch's confident centre dominates its
+context-starved edges. The fused value at pixel $\bm u$ is the weight-normalized
+average over all patches covering it:
+\begin{equation}
+S_T(\bm u)=\frac{\sum_i g(\bm u-\bm c_i)\,S^{(i)}_{\text{patch}}(\bm u)}
+{\sum_i g(\bm u-\bm c_i)},
+\qquad
+g(\bm d)=\exp\!\Big(\!-\tfrac{\|\bm d\|^2}{2\sigma^2}\Big),
+\end{equation}
+with $\bm c_i$ the centre of patch $i$. This averaging is what removes the
+boundary edge artefacts that plague whole-image UAD.
+
+\subsection{Multi-scale combination}
+\begin{equation}
+\label{eq:multiscale}
+S(\bm u)=\Big(\sum_{T}\omega_T\,S_T(\bm u)\Big)\,m_{\text{brain}}(\bm u),
+\qquad \omega=(0.25,0.45,0.30).
+\end{equation}
+Small $T$ (high SNR) is sensitive to fine/texture anomalies; large $T$ (low SNR)
+to large structural ones. The mid scale $T{=}150$ carries the most weight.
+
+\subsection{Cost accounting (matches the eval timing)}
+Per slice: $121$ patches $\times\,3$ scales $\times\,\approx50$ DDIM steps
+$\approx 1.8\times10^4$ U-Net forward passes, mini-batched in groups of $64$.
+The evaluation log shows $\approx$\textbf{92\,s/slice}, consistent with this
+budget on the A100.
+
+% =====================================================================
+\section{Stage 9 — Threshold calibration}
+% =====================================================================
+\code{calibrator.py} runs the \emph{same} multi-scale scorer on
+\code{val\_healthy} slices (which should score near zero), pools all healthy
+brain-voxel scores, and sets the operating threshold to their $95$th percentile:
+\begin{equation}
+\tau=\mathrm{percentile}_{95}\big(\{S(\bm u): m_{\text{brain}}(\bm u)=1,\ \text{healthy}\}\big).
+\end{equation}
+The saved \code{outputs/calibration.json} records the realised values:
+$\tau=\mathbf{0.1280}$, healthy-score mean $0.0535$, std $0.0385$, from
+$n=200$ healthy slices. \textbf{Reading $\tau$.} A test voxel above $0.128$ is
+more anomalous than $\approx95\%$ of healthy tissue, giving a controlled,
+label-free false-positive rate. Calibrating on held-out healthy val patients
+only (never test, never lesions) is leakage control \#4.
+
+% =====================================================================
+\section{Stage 10 — Evaluation and metrics}
+% =====================================================================
+
+\subsection{Per-slice procedure}
+\code{evaluator.py::evaluate} loads $\tau$, then for each test slice: scores it,
+optionally CRF-refines (the \emph{decision} thresholds the raw score, not the CRF
+map), thresholds at $\tau$ to get the prediction, and computes AUROC, AUPRC, Dice,
+plus an oracle Dice from a $60$-point threshold grid.
+
+\subsection{Metric definitions (\code{metrics.py})}
+\begin{align}
+\text{Dice}(P,G) &= \frac{2|P\cap G|}{|P|+|G|},\\
+\text{AUROC} &= \Pr\!\big(S(\bm u^+)>S(\bm u^-)\big)\ \text{over brain voxels},\\
+\text{AUPRC} &= \text{average precision over brain voxels},\\
+\text{oracle Dice} &= \max_{\theta\in\text{grid}}\ \text{Dice}\big(\mathbb 1[S>\theta],G\big).
+\end{align}
+\textbf{Symbols.} $P$ is the predicted lesion set, $G$ the ground-truth lesion
+set; $\bm u^+/\bm u^-$ are lesion/healthy voxels. AUROC/AUPRC are
+\emph{threshold-free} (they judge ranking quality); Dice is at the deployable
+$\tau$; oracle Dice is the per-slice best-threshold ceiling. The gap
+calibrated$\to$oracle quantifies how much is left on the table by a single global
+threshold.
+
+\subsection{What the evaluation actually covered}
+The eval log is indexed \code{[\,k/1000\,]} --- a $1000$-slice run was
+\emph{planned} --- but the last logged line is \code{[205/1000]}. Evaluation was
+therefore \textbf{truncated at $\approx$205 slices} (204 with valid metrics),
+spanning four test patients in order: \texttt{P00203, P00002, P00216, P00076}.
+This is precisely why every result is reported over \textbf{204 slices / 4
+patients} rather than the planned 1000. The truncation is the single biggest
+caveat on the headline numbers (see \S\ref{sec:reading}).
+
+\subsection{Aggregate and per-patient results}
+\begin{longtable}{@{}lrcccc@{}}
+\toprule
+Patient & Slices & AUROC & AUPRC & Dice (calib.) & Oracle Dice \\
+\midrule
+\endhead
+P00203 & 61 & 0.750 & 0.047 & 0.053 & 0.108 \\
+\textbf{P00002} & 36 & \textbf{0.893} & \textbf{0.222} & \textbf{0.270} & \textbf{0.321} \\
+P00216 & 53 & 0.571 & 0.039 & 0.035 & 0.073 \\
+P00076 & 54 & 0.692 & 0.046 & 0.013 & 0.112 \\
+\midrule
+\textbf{Overall} & \textbf{204} & \textbf{0.713} & \textbf{0.076} & \textbf{0.076} & \textbf{0.138} \\
+\bottomrule
+\end{longtable}
+\noindent
+The single best slice, \texttt{P00002\_z094}, reaches AUROC $0.965$ / Dice
+$0.589$ (saved in \code{numpy\_dumps/}). The worst diagnostic slice,
+\texttt{P00216\_z037}, has AUROC $0.44$.
+
+\subsection{Interpreting the numbers}
+\label{sec:reading}
+\begin{itemize}[leftmargin=1.4em,itemsep=1pt]
+\item \textbf{Score separability, not thresholding, is the bottleneck.} The
+calibrated$\to$oracle Dice gap ($0.076\!\to\!0.138$) is only $\approx0.06$; on
+P00216 even the oracle Dice is $0.073$ because many slices have AUROC $<0.5$ ---
+no threshold can rank a lesion that the score does not separate.
+\item \textbf{Strong bimodality.} P00002 (AUROC $0.893$) vs.\ P00216 (AUROC
+$0.571$). With only four test patients, one patient moves the mean substantially;
+the aggregate has no confidence interval and is not statistically robust.
+\item \textbf{Likely root cause (two diagnostic cases).} On the failure slice the
+residual is high across the \emph{whole} parenchyma and diffuse across
+\emph{every} modality (\code{numpy\_dumps} + \code{report\_figures}), i.e.\ the
+model cannot reconstruct that patient's healthy tissue well --- an out-of-manifold
+anatomy effect expected from a $30$-patient training set. This is a hypothesis
+from two cases, not a controlled result.
+\end{itemize}
+
+% =====================================================================
+\section{Stage 11 — Explainability}
+% =====================================================================
+
+\subsection{Counterfactual (primary)}
+\code{xai/counterfactual.py}: the healthy reconstruction $\hat\x$ \emph{is} the
+decision variable, so the anomaly map $|\x-\hat\x|$ is faithful by construction
+(no post-hoc surrogate). $\hat\x$ is the projection of the patient onto the
+learned healthy manifold --- ``what this brain would look like without disease''.
+The module also saves a DDIM ``healing trajectory'' (\code{trajectory\_frames}$=6$)
+showing the lesion being progressively in-painted.
+
+\subsection{Exact additive attribution (supporting)}
+Because the score in Eq.~\eqref{eq:multiscale} is an exact sum over modalities
+and scales, attribution is exact, not approximate:
+\begin{itemize}[leftmargin=1.4em,itemsep=0pt]
+\item \code{attribution.py::modality\_attribution} splits the score into the five
+weighted channel maps ($t1n,t1c,t2w,t2f,$CE) that sum back to it --- answering
+``is this lesion mainly FLAIR or enhancement?'';
+\item \code{scale\_attribution} splits it by noise scale $T$ --- low-$T$ dominance
+$\Rightarrow$ fine anomaly, high-$T$ $\Rightarrow$ structural.
+\end{itemize}
+On the success slice FLAIR dominates the genuine lesion; on the failure slice the
+signal spreads evenly across modalities --- the signature of a whole-brain
+reconstruction error rather than focal pathology.
+
+\subsection{Attention rollout (wired, not implemented)}
+\code{attribution.py::AttentionRollout} and the \code{attention\_rollout} config
+flag exist, but the class captures channel-mean feature magnitudes via forward
+hooks (a best-effort proxy) and is not part of the reported results. Tracing the
+true $12\times12$ self-attention back to patch positions is left as future work.
+
+% =====================================================================
+\section{End-to-end: one slice from raw input to metric}
+% =====================================================================
+Putting every stage together for a single test slice $\x_{\text{slice}}\in\R^{4\times256\times256}$:
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item \textbf{Mask}: $m_{\text{brain}}=$ hole-filled, $2$-px-eroded foreground.
+\item \textbf{Tile}: extract $121$ patches $\x\in\R^{4\times96\times96}$ (stride 16).
+\item \textbf{For each scale} $T\in\{50,150,250\}$:
+  \begin{enumerate}[leftmargin=1.3em,itemsep=0pt]
+  \item noise each patch to $T$ with simplex noise; DDIM-denoise ($\eta{=}0$,
+  $\approx50$ steps) with the EMA U-Net $\to\hat\x_0$;
+  \item residual stack $r_k$ + CE; modality-weighted scalar $S_{\text{patch}}$;
+  \item Gaussian-fuse the 121 patch maps $\to S_T$ (full slice).
+  \end{enumerate}
+\item \textbf{Combine scales}: $S=\sum_T\omega_T S_T$, masked.
+\item \textbf{Threshold}: $\hat P=\mathbb 1[S>\tau]\cdot m_{\text{brain}}$,
+$\tau=0.128$.
+\item \textbf{Score}: AUROC/AUPRC from $S$ vs.\ $G$; Dice from $\hat P$ vs.\ $G$;
+oracle Dice from the threshold grid.
+\item \textbf{Explain}: counterfactual $\hat\x$, $|\x-\hat\x|$, and the
+per-modality / per-scale attribution maps.
+\end{enumerate}
+The model is trained \emph{once} on healthy patches (Stage 5); steps 1--7 use only
+the frozen EMA weights and the single calibrated scalar $\tau$. No lesion label
+ever touches the model --- masks appear only in step 6.
+
+% =====================================================================
+\appendix
+\section{Source-file map}
+\begin{longtable}{@{}ll@{}}
+\toprule
+File & Contributes \\
+\midrule
+\code{src/config.py} & All constants (frozen dataclasses); shared \code{CONFIG}. \\
+\code{data/preprocessing.py} & NIfTI$\to$slices, healthy buffer, manifests, splits. \\
+\code{data/normalization.py} & Robust $[0.5,99.5]$ percentile $\to[-1,1]$. \\
+\code{data/patches.py} & Patch tiling + \code{GaussianPatchFuser}. \\
+\code{data/dataset.py} & \code{HealthyPatchDataset}, \code{AnomalousSliceDataset}. \\
+\code{noise/simplex.py} & Multi-octave correlated noise (unit-variance). \\
+\code{models/unet.py} & Builds \code{diffusers.UNet2DModel} (25.3\,M params). \\
+\code{models/diffusion.py} & Forward kernel, loss, DDIM \code{reconstruct}. \\
+\code{models/ema.py} & EMA shadow weights (used at val + inference). \\
+\code{training/trainer.py} & AdamW+warmup/cosine+EMA+AMP loop, resume, CSV. \\
+\code{scoring/residual.py} & Brain mask, modality weights, CE channel. \\
+\code{scoring/multiscale.py} & Per-scale reconstruct+fuse $\to$ \code{ScoreResult}. \\
+\code{calibration/calibrator.py} & $95$th-percentile healthy threshold ($\tau$). \\
+\code{evaluation/evaluator.py} & Per-slice scoring, thresholding, panels. \\
+\code{evaluation/metrics.py} & Dice, AUROC, AUPRC, oracle grid. \\
+\code{xai/counterfactual.py} & Healthy counterfactual + healing trajectory. \\
+\code{xai/attribution.py} & Exact modality/scale attribution; attention rollout. \\
+\bottomrule
+\end{longtable}
+
+\section{Key realised numbers (from \code{outputs/})}
+\begin{longtable}{@{}ll@{}}
+\toprule
+Quantity & Value (source) \\
+\midrule
+GPU & A100-SXM4-80GB (\code{train.log}) \\
+Train patches / epoch & 250{,}000 (final run); 2{,}088{,}400 (pilot) \\
+Val patches & 7{,}744 \\
+Steps / epoch & 714 (final); 5{,}438 (pilot) \\
+Effective batch size & $\approx$350 (final); $\approx$384 (pilot) --- \emph{not} the logged 128 \\
+Time / epoch & $\approx$565\,s ($\approx$9.4\,min) \\
+Epochs & 60 (resumed from 8) \\
+Best val loss & \textbf{0.06040 at epoch 58} \\
+Calibrated $\tau$ & 0.1280 ($n=200$ healthy slices) \\
+Healthy score mean / std & 0.0535 / 0.0385 \\
+Eval coverage & 204 valid slices / 4 patients (planned 1000, truncated at $\sim$205) \\
+Time / slice (eval) & $\approx$92\,s \\
+Overall AUROC / AUPRC / Dice / oracle & 0.713 / 0.076 / 0.076 / 0.138 \\
+Best slice (P00002\_z094) & AUROC 0.965 / Dice 0.589 \\
+\bottomrule
+\end{longtable}
+
+\end{document}

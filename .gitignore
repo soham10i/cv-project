@@ -24,3 +24,4 @@ brats-uad/local_models/
 *.safetensors
 .env
 .pt
+04_PDM/results.zip
